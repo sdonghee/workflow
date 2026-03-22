@@ -1,0 +1,97 @@
+"""
+설정 관리 모듈
+"""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# API 키
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+
+# 네이버 계정
+NAVER_ID = os.getenv("NAVER_ID", "")
+NAVER_PW = os.getenv("NAVER_PW", "")
+NAVER_BLOG_ID = os.getenv("NAVER_BLOG_ID", "")
+
+# 포스팅 설정
+POSTS_PER_DAY = int(os.getenv("POSTS_PER_DAY", "10"))
+POST_START_HOUR = int(os.getenv("POST_START_HOUR", "9"))
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# 카테고리별 RSS 피드 및 검색 키워드
+CATEGORIES = {
+    "여행_항공_호텔": {
+        "keywords": [
+            "해외여행 추천", "국내여행 명소", "항공권 할인", "호텔 추천",
+            "여행 팁", "비행기 탑승", "공항 이용", "여행지 후기",
+            "호캉스 추천", "가성비 숙소"
+        ],
+        "rss_feeds": [
+            "https://news.naver.com/main/rss/mnews/article.nhn?oid=001&sid1=102",
+            "https://www.yna.co.kr/travel/rss.xml",
+        ],
+        "search_queries": [
+            "2024 해외여행 추천 여행지",
+            "국내 여행 명소 추천",
+            "항공권 특가 이벤트",
+            "호텔 얼리버드 할인",
+            "여행 꿀팁 정보",
+        ],
+        "image_keywords": ["travel", "hotel", "airplane", "vacation", "tourism"],
+        "tags": ["여행", "해외여행", "국내여행", "항공", "호텔", "여행팁", "여행추천", "호캉스", "여행정보", "관광"],
+        "post_count": 4,
+    },
+    "정부혜택": {
+        "keywords": [
+            "정부 지원금", "복지 혜택", "청년 지원", "노인 복지",
+            "장애인 지원", "정부 보조금", "사회보험", "복지 신청",
+            "정부24", "복지로"
+        ],
+        "rss_feeds": [
+            "https://www.korea.kr/rss/policy.do",
+            "https://www.mohw.go.kr/rsm/rss/rssList.jsp",
+        ],
+        "search_queries": [
+            "2024 정부 지원금 신청",
+            "청년 정부 혜택 총정리",
+            "노인 복지 혜택 안내",
+            "저소득층 지원 정책",
+            "정부 보조금 신청 방법",
+        ],
+        "image_keywords": ["government", "welfare", "support", "community", "Korea"],
+        "tags": ["정부혜택", "정부지원금", "복지혜택", "청년지원", "노인복지", "사회보험", "정부보조금", "복지신청", "지원정책", "생활정보"],
+        "post_count": 3,
+    },
+    "건강": {
+        "keywords": [
+            "건강 정보", "질병 예방", "운동 방법", "다이어트",
+            "영양 정보", "건강식품", "의학 정보", "건강검진",
+            "정신건강", "수면 건강"
+        ],
+        "rss_feeds": [
+            "https://health.chosun.com/rss/feed.xml",
+            "https://kormedi.com/feed/",
+        ],
+        "search_queries": [
+            "건강 관리 방법 최신",
+            "질병 예방 건강 정보",
+            "다이어트 운동 효과",
+            "건강한 식단 영양",
+            "정신건강 관리 팁",
+        ],
+        "image_keywords": ["health", "fitness", "wellness", "medicine", "exercise"],
+        "tags": ["건강", "건강정보", "건강관리", "다이어트", "운동", "영양", "질병예방", "건강식품", "의학정보", "웰빙"],
+        "post_count": 3,
+    },
+}
+
+# 게시 간격 (분) - 하루 포스팅이 고르게 분산되도록
+POSTING_INTERVAL_MINUTES = (8 * 60) // POSTS_PER_DAY  # 9시~17시 사이에 분산
+
+# 로그 파일 경로
+LOG_FILE = "naver_blog_auto.log"
+POSTED_LOG_FILE = "posted_articles.json"

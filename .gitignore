@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+venv/
+logs/
+drafts/
+posted_articles.json
+naver_blog_auto.log
+*.log
