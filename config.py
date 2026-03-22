@@ -17,7 +17,7 @@ NAVER_PW = os.getenv("NAVER_PW", "")
 NAVER_BLOG_ID = os.getenv("NAVER_BLOG_ID", "")
 
 # 포스팅 설정
-POSTS_PER_DAY = int(os.getenv("POSTS_PER_DAY", "10"))
+POSTS_PER_DAY = int(os.getenv("POSTS_PER_DAY", "7"))
 POST_START_HOUR = int(os.getenv("POST_START_HOUR", "9"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
