@@ -74,7 +74,10 @@ def fetch_rss_articles(rss_url, max_articles=5):
 
         for item in items[:max_articles]:
             def get_text(tag):
-                el = item.find(tag) or item.find(f"atom:{tag}", ns)
+                # ElementTree에서 자식 없는 Element는 bool() = False이므로 'or' 사용 금지
+                el = item.find(tag)
+                if el is None:
+                    el = item.find(f"atom:{tag}", ns)
                 return el.text.strip() if el is not None and el.text else ""
 
             link_el = item.find("link")
