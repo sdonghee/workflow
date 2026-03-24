@@ -1,6 +1,6 @@
 """
 메인 일일 포스팅 오케스트레이터
-매일 10개의 블로그 포스트를 자동으로 생성하고 게시합니다.
+멀티 블로그 지원: BLOGS 설정에 등록된 모든 블로그에 자동 포스팅
 """
 import logging
 import json
@@ -11,9 +11,8 @@ from content_fetcher import collect_all_content, fetch_web_content, save_posted_
 from content_writer import generate_blog_post, create_post_from_scratch
 from image_finder import get_free_image_url
 from naver_poster import post_blog, save_post_locally
-from config import CATEGORIES, POSTING_INTERVAL_MINUTES, LOG_FILE, LOG_LEVEL
+from config import CATEGORIES, BLOGS, POSTING_INTERVAL_MINUTES, LOG_FILE, LOG_LEVEL
 
-# 로깅 설정
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, "INFO"),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -25,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def process_article(category_name, category_config, article):
+def process_article(category_name, category_config, article, blog_config):
     """
     단일 기사를 블로그 포스트로 변환하고 게시
 
@@ -33,18 +32,15 @@ def process_article(category_name, category_config, article):
         bool: 성공 여부
     """
     try:
-        logger.info(f"처리 시작: [{category_name}] {article.get('title', '')[:50]}")
+        logger.info(f"[{blog_config['name']}] 처리 시작: [{category_name}] {article.get('title', '')[:50]}")
 
-        # 원본 기사 내용 보강 (링크가 있으면 전체 내용 수집)
         if article.get("link"):
             full_content = fetch_web_content(article["link"])
             article["content"] = full_content
 
-        # 이미지 검색
         image_keywords = category_config.get("image_keywords", ["korea"])
         image_url, image_alt, photographer = get_free_image_url(category_name, image_keywords)
 
-        # AI로 블로그 포스트 생성
         post_data = generate_blog_post(
             category=category_name,
             article=article,
@@ -53,119 +49,144 @@ def process_article(category_name, category_config, article):
         )
 
         if not post_data:
-            logger.error(f"포스트 생성 실패: {article.get('title', '')}")
+            logger.error(f"[{blog_config['name']}] 포스트 생성 실패: {article.get('title', '')}")
             return False
 
         title = post_data.get("title", article.get("title", ""))
         content_html = post_data.get("content_html", "")
         tags = post_data.get("tags", ",".join(category_config.get("tags", [])))
 
-        # 사진 출처 표시 (저작권 준수)
         if photographer:
             content_html += f'\n<p style="font-size:12px; color:#999; text-align:right;">📸 사진: {photographer} (무료 이미지)</p>'
 
-        # 네이버 블로그에 게시
-        logger.info(f"포스팅 시도: {title}")
-        success = post_blog(title, content_html, tags, category_name)
+        logger.info(f"[{blog_config['name']}] 포스팅 시도: {title}")
+        success = post_blog(title, content_html, tags, category_name, blog_config)
 
         if success:
-            # 게시된 글 기록
             article_hash = get_article_hash(article.get("title", ""), article.get("summary", ""))
             save_posted_article(article_hash)
-            logger.info(f"✅ 포스팅 완료: {title}")
+            logger.info(f"[{blog_config['name']}] ✅ 포스팅 완료: {title}")
         else:
-            # 실패 시 로컬 저장
-            save_post_locally(title, content_html, tags, category_name)
-            logger.warning(f"⚠️ 포스팅 실패, 임시 저장: {title}")
+            save_post_locally(title, content_html, tags, category_name, blog_config)
+            logger.warning(f"[{blog_config['name']}] ⚠️ 포스팅 실패, 임시 저장: {title}")
 
         return success
 
     except Exception as e:
-        logger.error(f"기사 처리 중 오류: {e}", exc_info=True)
+        logger.error(f"[{blog_config['name']}] 기사 처리 중 오류: {e}", exc_info=True)
         return False
 
 
-def run_daily_posting():
+def run_blog_posting(blog_config, all_content):
     """
-    하루치 포스팅 실행 (총 10개)
-    """
-    start_time = datetime.now()
-    logger.info("=" * 60)
-    logger.info(f"일일 포스팅 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 60)
+    단일 블로그의 하루치 포스팅 실행
 
-    # 콘텐츠 수집
-    logger.info("📡 콘텐츠 수집 중...")
-    all_content = collect_all_content()
+    Returns:
+        (posted_count, failed_count)
+    """
+    blog_name = blog_config["name"]
+    assigned_categories = blog_config["categories"]
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"📝 블로그 포스팅 시작: {blog_name}")
+    logger.info(f"   담당 카테고리: {', '.join(assigned_categories)}")
+    logger.info(f"{'='*60}")
 
     total_posted = 0
     total_failed = 0
-    posting_results = []
 
-    # 카테고리별로 포스팅
-    for category_name, category_data in all_content.items():
+    for category_name in assigned_categories:
+        if category_name not in all_content:
+            logger.warning(f"[{blog_name}] 카테고리 없음: {category_name}")
+            continue
+
+        category_data = all_content[category_name]
         articles = category_data["articles"]
         category_config = category_data["config"]
         target_count = category_data["post_count"]
 
-        logger.info(f"\n📂 카테고리: {category_name} (목표: {target_count}개)")
+        logger.info(f"\n📂 [{blog_name}] 카테고리: {category_name} (목표: {target_count}개)")
 
         posted_count = 0
         for i, article in enumerate(articles):
             if posted_count >= target_count:
                 break
 
-            success = process_article(category_name, category_config, article)
+            success = process_article(category_name, category_config, article, blog_config)
 
             if success:
                 posted_count += 1
                 total_posted += 1
-                posting_results.append({
-                    "category": category_name,
-                    "status": "success",
-                    "article": article.get("title", "")[:50],
-                })
             else:
                 total_failed += 1
-                posting_results.append({
-                    "category": category_name,
-                    "status": "failed",
-                    "article": article.get("title", "")[:50],
-                })
 
-            # 포스팅 간격 (네이버 스팸 방지)
             if i < len(articles) - 1 and posted_count < target_count:
                 wait_minutes = max(5, POSTING_INTERVAL_MINUTES)
                 logger.info(f"⏳ {wait_minutes}분 대기 중...")
                 time.sleep(wait_minutes * 60)
 
-        # 수집된 기사가 부족한 경우 처음부터 생성
+        # 기사 부족 시 처음부터 생성
         if posted_count < target_count:
             for _ in range(target_count - posted_count):
-                logger.info(f"📝 기사 부족으로 신규 콘텐츠 생성")
+                logger.info(f"[{blog_name}] 📝 기사 부족으로 신규 콘텐츠 생성")
                 post_data = create_post_from_scratch(category_name, category_name, category_config)
                 if post_data:
                     title = post_data.get("title", "")
                     content_html = post_data.get("content_html", "")
                     tags = post_data.get("tags", "")
-                    success = post_blog(title, content_html, tags, category_name)
+                    success = post_blog(title, content_html, tags, category_name, blog_config)
                     if success:
                         posted_count += 1
                         total_posted += 1
                     else:
-                        save_post_locally(title, content_html, tags, category_name)
+                        save_post_locally(title, content_html, tags, category_name, blog_config)
                         total_failed += 1
                 time.sleep(POSTING_INTERVAL_MINUTES * 60)
+
+    return total_posted, total_failed
+
+
+def run_daily_posting():
+    """
+    전체 블로그 하루치 포스팅 실행
+    BLOGS에 등록된 모든 블로그를 순서대로 처리
+    """
+    start_time = datetime.now()
+    logger.info("=" * 60)
+    logger.info(f"일일 포스팅 시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"등록된 블로그: {len(BLOGS)}개 - {', '.join(b['name'] for b in BLOGS.values())}")
+    logger.info("=" * 60)
+
+    # 콘텐츠 수집 (전체 카테고리 한 번에)
+    logger.info("📡 콘텐츠 수집 중...")
+    all_content = collect_all_content()
+
+    grand_total_posted = 0
+    grand_total_failed = 0
+    blog_results = {}
+
+    for blog_key, blog_config in BLOGS.items():
+        if not blog_config.get("naver_id") or not blog_config.get("blog_id"):
+            logger.warning(f"[{blog_config['name']}] .env 설정 미완료, 스킵")
+            continue
+
+        posted, failed = run_blog_posting(blog_config, all_content)
+        grand_total_posted += posted
+        grand_total_failed += failed
+        blog_results[blog_key] = {"posted": posted, "failed": failed}
 
     # 결과 요약
     end_time = datetime.now()
     duration = (end_time - start_time).seconds // 60
 
     logger.info("\n" + "=" * 60)
-    logger.info("📊 일일 포스팅 결과")
+    logger.info("📊 전체 일일 포스팅 결과")
     logger.info("=" * 60)
-    logger.info(f"✅ 성공: {total_posted}개")
-    logger.info(f"❌ 실패: {total_failed}개")
+    for blog_key, result in blog_results.items():
+        name = BLOGS[blog_key]["name"]
+        logger.info(f"  {name}: 성공 {result['posted']}개 / 실패 {result['failed']}개")
+    logger.info(f"✅ 총 성공: {grand_total_posted}개")
+    logger.info(f"❌ 총 실패: {grand_total_failed}개")
     logger.info(f"⏱️ 소요 시간: {duration}분")
     logger.info("=" * 60)
 
@@ -174,9 +195,9 @@ def run_daily_posting():
         "date": start_time.strftime("%Y-%m-%d"),
         "start_time": start_time.isoformat(),
         "end_time": end_time.isoformat(),
-        "total_posted": total_posted,
-        "total_failed": total_failed,
-        "results": posting_results,
+        "total_posted": grand_total_posted,
+        "total_failed": grand_total_failed,
+        "blogs": blog_results,
     }
 
     os.makedirs("logs", exist_ok=True)
@@ -184,7 +205,7 @@ def run_daily_posting():
     with open(log_file, "w", encoding="utf-8") as f:
         json.dump(result_log, f, ensure_ascii=False, indent=2)
 
-    return total_posted, total_failed
+    return grand_total_posted, grand_total_failed
 
 
 if __name__ == "__main__":

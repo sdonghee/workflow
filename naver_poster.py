@@ -2,6 +2,7 @@
 네이버 블로그 자동 포스팅 모듈
 - 쿠키 저장 방식으로 캡차 없이 안정적으로 로그인
 - 처음 한 번만 수동 로그인 → 이후 자동으로 쿠키 사용
+- 멀티 블로그 지원: blog_config 딕셔너리로 계정 전달
 """
 import asyncio
 import logging
@@ -9,27 +10,25 @@ import json
 import os
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from config import NAVER_ID, NAVER_PW, NAVER_BLOG_ID, HEADLESS
+from config import HEADLESS
 
 logger = logging.getLogger(__name__)
-
-COOKIE_FILE = "naver_cookies.json"
 
 
 # ─────────────────────────────────────────
 # 쿠키 저장 / 불러오기
 # ─────────────────────────────────────────
 
-def save_cookies(cookies):
-    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+def save_cookies(cookies, cookie_file):
+    with open(cookie_file, "w", encoding="utf-8") as f:
         json.dump(cookies, f, ensure_ascii=False, indent=2)
-    logger.info(f"쿠키 저장 완료: {COOKIE_FILE}")
+    logger.info(f"쿠키 저장 완료: {cookie_file}")
 
 
-def load_cookies():
-    if not os.path.exists(COOKIE_FILE):
+def load_cookies(cookie_file):
+    if not os.path.exists(cookie_file):
         return None
-    with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+    with open(cookie_file, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -37,14 +36,13 @@ def load_cookies():
 # 로그인 상태 확인
 # ─────────────────────────────────────────
 
-async def is_logged_in(page):
+async def is_logged_in(page, naver_id):
     """현재 네이버에 로그인되어 있는지 확인"""
     try:
         await page.goto("https://www.naver.com", wait_until="domcontentloaded", timeout=15000)
         await page.wait_for_timeout(2000)
-        # 로그인 상태면 내 아이디가 보임
         content = await page.content()
-        return NAVER_ID.lower() in content.lower() or "로그아웃" in content
+        return naver_id.lower() in content.lower() or "로그아웃" in content
     except Exception:
         return False
 
@@ -53,24 +51,24 @@ async def is_logged_in(page):
 # 쿠키로 로그인 시도
 # ─────────────────────────────────────────
 
-async def login_with_cookies(context, page):
+async def login_with_cookies(context, page, blog_config):
     """저장된 쿠키로 로그인 시도"""
-    cookies = load_cookies()
+    cookies = load_cookies(blog_config["cookie_file"])
     if not cookies:
-        logger.info("저장된 쿠키 없음")
+        logger.info(f"[{blog_config['name']}] 저장된 쿠키 없음")
         return False
 
     try:
         await context.add_cookies(cookies)
-        logged_in = await is_logged_in(page)
+        logged_in = await is_logged_in(page, blog_config["naver_id"])
         if logged_in:
-            logger.info("✅ 쿠키 로그인 성공")
+            logger.info(f"[{blog_config['name']}] ✅ 쿠키 로그인 성공")
             return True
         else:
-            logger.info("쿠키가 만료되었습니다. 재로그인 필요")
+            logger.info(f"[{blog_config['name']}] 쿠키가 만료되었습니다. 재로그인 필요")
             return False
     except Exception as e:
-        logger.error(f"쿠키 로그인 실패: {e}")
+        logger.error(f"[{blog_config['name']}] 쿠키 로그인 실패: {e}")
         return False
 
 
@@ -78,40 +76,39 @@ async def login_with_cookies(context, page):
 # 자동 로그인 (ID/PW)
 # ─────────────────────────────────────────
 
-async def login_with_password(page):
+async def login_with_password(page, blog_config):
     """ID/PW로 로그인 (쿠키 없을 때 또는 만료 시)"""
+    naver_id = blog_config["naver_id"]
+    naver_pw = blog_config["naver_pw"]
     try:
         await page.goto("https://nid.naver.com/nidlogin.login", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
-        # ID 입력 (사람처럼 천천히)
         await page.click("#id")
         await page.wait_for_timeout(500)
-        for char in NAVER_ID:
+        for char in naver_id:
             await page.type("#id", char, delay=80)
         await page.wait_for_timeout(700)
 
-        # PW 입력 (사람처럼 천천히)
         await page.click("#pw")
         await page.wait_for_timeout(500)
-        for char in NAVER_PW:
+        for char in naver_pw:
             await page.type("#pw", char, delay=80)
         await page.wait_for_timeout(700)
 
-        # 로그인 버튼
         await page.click(".btn_login")
         await page.wait_for_timeout(4000)
 
         current_url = page.url
         if "nidlogin" in current_url:
-            logger.error("❌ 로그인 실패 - 캡차 또는 계정 오류. first_login.py 를 실행하세요")
+            logger.error(f"[{blog_config['name']}] ❌ 로그인 실패 - 캡차 또는 계정 오류. first_login.py 를 실행하세요")
             return False
 
-        logger.info("✅ ID/PW 로그인 성공")
+        logger.info(f"[{blog_config['name']}] ✅ ID/PW 로그인 성공")
         return True
 
     except Exception as e:
-        logger.error(f"로그인 오류: {e}")
+        logger.error(f"[{blog_config['name']}] 로그인 오류: {e}")
         return False
 
 
@@ -119,12 +116,10 @@ async def login_with_password(page):
 # 메인 포스팅 함수
 # ─────────────────────────────────────────
 
-async def post_to_naver_blog(title, content_html, tags, category=""):
+async def post_to_naver_blog(title, content_html, tags, category, blog_config):
     """
     네이버 블로그에 글 포스팅
-    1. 쿠키로 로그인 시도
-    2. 실패 시 ID/PW로 로그인 후 쿠키 저장
-    3. 글쓰기 페이지에서 제목/본문/태그 입력 후 발행
+    blog_config: BLOGS dict의 개별 블로그 설정
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -141,7 +136,6 @@ async def post_to_naver_blog(title, content_html, tags, category=""):
             locale="ko-KR",
         )
 
-        # 봇 감지 우회
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         """)
@@ -150,29 +144,28 @@ async def post_to_naver_blog(title, content_html, tags, category=""):
 
         try:
             # 1. 쿠키로 로그인 시도
-            logged_in = await login_with_cookies(context, page)
+            logged_in = await login_with_cookies(context, page, blog_config)
 
             # 2. 쿠키 만료 시 ID/PW 로그인
             if not logged_in:
-                logged_in = await login_with_password(page)
+                logged_in = await login_with_password(page, blog_config)
                 if not logged_in:
                     return False
-                # 새 쿠키 저장
                 cookies = await context.cookies()
-                save_cookies(cookies)
+                save_cookies(cookies, blog_config["cookie_file"])
 
             # 3. 글쓰기 페이지 이동
-            write_url = f"https://blog.naver.com/PostWriteForm.naver?blogId={NAVER_BLOG_ID}"
+            blog_id = blog_config["blog_id"]
+            write_url = f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}"
             await page.goto(write_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(4000)
 
-            # 새 탭이 열린 경우
             if len(context.pages) > 1:
                 page = context.pages[-1]
                 await page.wait_for_load_state("domcontentloaded")
                 await page.wait_for_timeout(3000)
 
-            logger.info(f"글쓰기 페이지: {page.url}")
+            logger.info(f"[{blog_config['name']}] 글쓰기 페이지: {page.url}")
 
             # 4. 제목 입력
             await _enter_title(page, title)
@@ -190,18 +183,17 @@ async def post_to_naver_blog(title, content_html, tags, category=""):
             success = await _publish(page)
 
             if success:
-                # 발행 후 쿠키 갱신 저장
                 cookies = await context.cookies()
-                save_cookies(cookies)
-                logger.info(f"✅ 포스팅 완료: {title}")
+                save_cookies(cookies, blog_config["cookie_file"])
+                logger.info(f"[{blog_config['name']}] ✅ 포스팅 완료: {title}")
 
             return success
 
         except PlaywrightTimeout as e:
-            logger.error(f"타임아웃 오류: {e}")
+            logger.error(f"[{blog_config['name']}] 타임아웃 오류: {e}")
             return False
         except Exception as e:
-            logger.error(f"포스팅 오류: {e}", exc_info=True)
+            logger.error(f"[{blog_config['name']}] 포스팅 오류: {e}", exc_info=True)
             return False
         finally:
             await page.wait_for_timeout(1000)
@@ -229,7 +221,6 @@ async def _enter_title(page, title):
         except Exception:
             continue
 
-    # iframe 안쪽 시도
     for frame in page.frames:
         try:
             await frame.click("input[placeholder*='제목']", timeout=2000)
@@ -272,7 +263,6 @@ async def _enter_content(page, content_html):
         except Exception:
             continue
 
-    # iframe 안쪽 시도
     for frame in page.frames:
         try:
             el = await frame.query_selector("[contenteditable='true']")
@@ -323,7 +313,6 @@ async def _publish(page):
             await page.click(selector, timeout=4000)
             await page.wait_for_timeout(3000)
 
-            # 확인 팝업 처리
             for confirm in ["button:has-text('확인')", ".btn_confirm", ".btn_ok"]:
                 try:
                     await page.click(confirm, timeout=2000)
@@ -344,23 +333,27 @@ async def _publish(page):
 # 동기 래퍼 & 로컬 저장
 # ─────────────────────────────────────────
 
-def post_blog(title, content_html, tags, category=""):
+def post_blog(title, content_html, tags, category, blog_config):
     """동기 함수 래퍼"""
-    return asyncio.run(post_to_naver_blog(title, content_html, tags, category))
+    return asyncio.run(post_to_naver_blog(title, content_html, tags, category, blog_config))
 
 
-def save_post_locally(title, content_html, tags, category, filename=None):
+def save_post_locally(title, content_html, tags, category, blog_config, filename=None):
     """포스팅 실패 시 로컬 임시 저장"""
-    os.makedirs("drafts", exist_ok=True)
+    blog_key = blog_config.get("blog_id", "unknown")
+    drafts_dir = f"drafts/{blog_key}"
+    os.makedirs(drafts_dir, exist_ok=True)
+
     if not filename:
         safe_title = "".join(c for c in title[:30] if c.isalnum() or c in " _-")
-        filename = f"drafts/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_title}.json"
+        filename = f"{drafts_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_title}.json"
 
     draft = {
         "title": title,
         "content_html": content_html,
         "tags": tags,
         "category": category,
+        "blog": blog_config.get("name", ""),
         "created_at": datetime.now().isoformat(),
         "posted": False,
     }

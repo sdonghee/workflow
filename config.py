@@ -11,18 +11,47 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 
-# 네이버 계정
-NAVER_ID = os.getenv("NAVER_ID", "")
-NAVER_PW = os.getenv("NAVER_PW", "")
-NAVER_BLOG_ID = os.getenv("NAVER_BLOG_ID", "")
-
 # 포스팅 설정
 POSTS_PER_DAY = int(os.getenv("POSTS_PER_DAY", "7"))
 POST_START_HOUR = int(os.getenv("POST_START_HOUR", "9"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# 카테고리별 RSS 피드 및 검색 키워드
+# ─────────────────────────────────────────
+# 멀티 블로그 설정
+# 블로그 추가 시 여기에 항목만 추가하면 됩니다
+# ─────────────────────────────────────────
+BLOGS = {
+    "travel": {
+        "name": "여행/항공/호텔 블로그",
+        "naver_id": os.getenv("BLOG1_NAVER_ID", ""),
+        "naver_pw": os.getenv("BLOG1_NAVER_PW", ""),
+        "blog_id": os.getenv("BLOG1_BLOG_ID", ""),
+        "cookie_file": "cookies_blog1.json",
+        "categories": ["여행_항공_호텔"],
+    },
+    "info": {
+        "name": "정보/건강 블로그",
+        "naver_id": os.getenv("BLOG2_NAVER_ID", ""),
+        "naver_pw": os.getenv("BLOG2_NAVER_PW", ""),
+        "blog_id": os.getenv("BLOG2_BLOG_ID", ""),
+        "cookie_file": "cookies_blog2.json",
+        "categories": ["정부혜택", "건강"],
+    },
+    # 3번째 블로그 추가 시 아래 주석 해제 후 .env에 BLOG3_* 추가
+    # "blog3": {
+    #     "name": "세 번째 블로그",
+    #     "naver_id": os.getenv("BLOG3_NAVER_ID", ""),
+    #     "naver_pw": os.getenv("BLOG3_NAVER_PW", ""),
+    #     "blog_id": os.getenv("BLOG3_BLOG_ID", ""),
+    #     "cookie_file": "cookies_blog3.json",
+    #     "categories": ["카테고리명"],
+    # },
+}
+
+# ─────────────────────────────────────────
+# 카테고리별 콘텐츠 설정
+# ─────────────────────────────────────────
 CATEGORIES = {
     "여행_항공_호텔": {
         "keywords": [
@@ -89,8 +118,8 @@ CATEGORIES = {
     },
 }
 
-# 게시 간격 (분) - 하루 포스팅이 고르게 분산되도록
-POSTING_INTERVAL_MINUTES = (8 * 60) // POSTS_PER_DAY  # 9시~17시 사이에 분산
+# 게시 간격 (분)
+POSTING_INTERVAL_MINUTES = (8 * 60) // POSTS_PER_DAY
 
 # 로그 파일 경로
 LOG_FILE = "naver_blog_auto.log"
