@@ -52,7 +52,11 @@ def fetch_rss_articles(rss_url, max_articles=5):
     """RSS 피드에서 최신 기사 수집"""
     articles = []
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; RSSReader/1.0)"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/rss+xml, application/xml, text/xml, */*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        }
         response = requests.get(rss_url, headers=headers, timeout=10)
         root = ET.fromstring(response.content)
 
@@ -123,17 +127,35 @@ def search_naver_news(query, display=5):
     """네이버 뉴스 검색 (공개 검색 - API 키 불필요)"""
     articles = []
     try:
-        url = f"https://search.naver.com/search.naver?where=news&query={requests.utils.quote(query)}&sort=1&ds=&de=&mynews=0&office_type=0&office_section_code=0&news_office_checked=&nso=so:dd,p:all,a:all&start=1"
+        url = f"https://search.naver.com/search.naver?where=news&query={requests.utils.quote(query)}&sort=1"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+            "Referer": "https://www.naver.com/",
         }
         response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, "lxml")
 
-        news_items = soup.select(".news_area")
+        # 여러 셀렉터 패턴 시도 (네이버 UI 업데이트 대응)
+        news_items = (
+            soup.select("ul.list_news > li.bx") or
+            soup.select(".news_area") or
+            soup.select(".news_wrap") or
+            soup.select("li.bx")
+        )
         for item in news_items[:display]:
-            title_el = item.select_one(".news_tit")
-            desc_el = item.select_one(".news_dsc")
+            title_el = (
+                item.select_one("a.news_tit") or
+                item.select_one(".news_tit") or
+                item.select_one("a[class*='title']")
+            )
+            desc_el = (
+                item.select_one(".dsc_txt_wrap") or
+                item.select_one(".dsc_txt") or
+                item.select_one(".news_dsc") or
+                item.select_one("a.api_txt_lines")
+            )
             if title_el:
                 articles.append({
                     "title": title_el.get_text(strip=True),

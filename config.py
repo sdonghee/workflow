@@ -60,11 +60,11 @@ CATEGORIES = {
             "호캉스 추천", "가성비 숙소"
         ],
         "rss_feeds": [
-            "https://news.naver.com/main/rss/mnews/article.nhn?oid=001&sid1=102",
-            "https://www.yna.co.kr/travel/rss.xml",
+            "https://www.yna.co.kr/rss/travel.xml",
+            "https://rss.hankyung.com/economy.xml",
         ],
         "search_queries": [
-            "2024 해외여행 추천 여행지",
+            "2026 해외여행 추천 여행지",
             "국내 여행 명소 추천",
             "항공권 특가 이벤트",
             "호텔 얼리버드 할인",
@@ -82,10 +82,10 @@ CATEGORIES = {
         ],
         "rss_feeds": [
             "https://www.korea.kr/rss/policy.do",
-            "https://www.mohw.go.kr/rsm/rss/rssList.jsp",
+            "https://rss.hankyung.com/society.xml",
         ],
         "search_queries": [
-            "2024 정부 지원금 신청",
+            "2026 정부 지원금 신청",
             "청년 정부 혜택 총정리",
             "노인 복지 혜택 안내",
             "저소득층 지원 정책",
@@ -102,11 +102,11 @@ CATEGORIES = {
             "정신건강", "수면 건강"
         ],
         "rss_feeds": [
-            "https://health.chosun.com/rss/feed.xml",
             "https://kormedi.com/feed/",
+            "https://rss.hankyung.com/it.xml",
         ],
         "search_queries": [
-            "건강 관리 방법 최신",
+            "2026 건강 관리 방법",
             "질병 예방 건강 정보",
             "다이어트 운동 효과",
             "건강한 식단 영양",
