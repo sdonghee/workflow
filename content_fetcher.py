@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 import logging
 import json
 import os
+import re
 import hashlib
 from datetime import datetime, timedelta
 from config import CATEGORIES, POSTED_LOG_FILE
@@ -58,7 +59,14 @@ def fetch_rss_articles(rss_url, max_articles=5):
             "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
         }
         response = requests.get(rss_url, headers=headers, timeout=10)
-        root = ET.fromstring(response.content)
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError:
+            # 한국 RSS 피드의 인코딩 문제 처리 (예: & 미이스케이프)
+            encoding = response.apparent_encoding or "utf-8"
+            text = response.content.decode(encoding, errors="replace")
+            text = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)", "&amp;", text)
+            root = ET.fromstring(text.encode("utf-8"))
 
         # RSS 2.0 또는 Atom 형식 처리
         ns = {"atom": "http://www.w3.org/2005/Atom"}

@@ -60,8 +60,8 @@ CATEGORIES = {
             "호캉스 추천", "가성비 숙소"
         ],
         "rss_feeds": [
-            "https://www.yna.co.kr/rss/travel.xml",
             "https://rss.hankyung.com/economy.xml",
+            "https://www.hankookilbo.com/rss/section/travel",
         ],
         "search_queries": [
             "2026 해외여행 추천 여행지",
