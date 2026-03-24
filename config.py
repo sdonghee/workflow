@@ -8,6 +8,7 @@ load_dotenv()
 
 # API 키
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 

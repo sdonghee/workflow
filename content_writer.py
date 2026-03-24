@@ -1,14 +1,19 @@
 """
 AI 콘텐츠 생성 모듈
-Claude AI를 사용하여 저작권에 걸리지 않는 고품질 블로그 포스트를 생성합니다.
+OpenRouter API를 사용하여 저작권에 걸리지 않는 고품질 블로그 포스트를 생성합니다.
 """
-import anthropic
 import logging
-from config import ANTHROPIC_API_KEY
+from openai import OpenAI
+from config import OPENROUTER_API_KEY
 
 logger = logging.getLogger(__name__)
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
+
+MODEL = "nousresearch/hermes-3-llama-3.1-405b:free"
 
 
 def generate_blog_post(category, article, image_url="", image_alt=""):
@@ -67,19 +72,16 @@ def generate_blog_post(category, article, image_url="", image_alt=""):
 """
 
     try:
-        message = client.messages.create(
-            model="claude-sonnet-4-6",
+        response = client.chat.completions.create(
+            model=MODEL,
             max_tokens=4096,
             messages=[
-                {
-                    "role": "user",
-                    "content": user_prompt
-                }
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
-            system=system_prompt,
         )
 
-        response_text = message.content[0].text.strip()
+        response_text = response.choices[0].message.content.strip()
 
         # JSON 파싱
         import json
@@ -121,12 +123,12 @@ def generate_visual_summary(topic, category):
 HTML 코드만 반환하세요 (설명 없이).
 """
     try:
-        message = client.messages.create(
-            model="claude-sonnet-4-6",
+        response = client.chat.completions.create(
+            model=MODEL,
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
-        return message.content[0].text.strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"시각화 요약 생성 실패: {e}")
         return ""
