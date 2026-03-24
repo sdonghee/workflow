@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  blog-poster:
+    build: .
+    container_name: naver-blog-poster
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./cookies_blog1.json:/app/cookies_blog1.json
+      - ./cookies_blog2.json:/app/cookies_blog2.json
+      - ./posted_articles.json:/app/posted_articles.json
+      - ./naver_blog_auto.log:/app/naver_blog_auto.log
+    environment:
+      - HEADLESS=true
