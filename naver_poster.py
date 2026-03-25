@@ -146,17 +146,22 @@ async def _launch_browser(p):
 
     # 2) Firefox
     try:
-        browser = await p.firefox.launch(headless=HEADLESS)
+        browser = await p.firefox.launch(
+            headless=HEADLESS,
+            firefox_user_prefs={
+                "network.captive-portal-service.enabled": False,
+                "browser.tabs.remote.autostart": False,
+            },
+        )
         logger.info("브라우저: Firefox")
         return browser, "firefox"
     except Exception as e:
+        logger.error(f"Firefox 실행 오류 상세: {e}")
         if not _is_missing_lib_error(e):
             raise
         raise BrowserUnavailableError(
-            "Chromium/Firefox 모두 실행 불가. GTK3 라이브러리가 없습니다.\n"
-            "Synology NAS에서 Entware가 설치되어 있다면:\n"
-            "  opkg update && opkg install libgtk3 libatk\n"
-            "또는 DSM 패키지 센터에서 필요한 라이브러리를 설치하세요."
+            "Chromium/Firefox 모두 실행 불가. 시스템 라이브러리 부족.\n"
+            f"Firefox 오류: {e}"
         ) from e
 
 
