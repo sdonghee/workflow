@@ -12,5 +12,8 @@ services:
       - ./cookies_blog2.json:/app/cookies_blog2.json
       - ./posted_articles.json:/app/posted_articles.json
       - ./naver_blog_auto.log:/app/naver_blog_auto.log
+      - ./drafts:/app/drafts
+      - ./logs:/app/logs
     environment:
       - HEADLESS=true
+    shm_size: '256mb'
