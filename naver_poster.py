@@ -116,23 +116,39 @@ async def login_with_password(page, blog_config):
 # 메인 포스팅 함수
 # ─────────────────────────────────────────
 
+async def _launch_browser(p):
+    """Chromium 실행 시도 → 라이브러리 오류 시 Firefox로 폴백"""
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+    ]
+    try:
+        browser = await p.chromium.launch(headless=HEADLESS, args=chromium_args)
+        logger.info("브라우저: Chromium")
+        return browser, "chromium"
+    except Exception as e:
+        if "shared libraries" in str(e) or "exitCode=127" in str(e) or "libatk" in str(e):
+            logger.warning(f"Chromium 실행 실패 (시스템 라이브러리 부족), Firefox로 전환: {e}")
+            browser = await p.firefox.launch(headless=HEADLESS)
+            logger.info("브라우저: Firefox")
+            return browser, "firefox"
+        raise
+
+
 async def post_to_naver_blog(title, content_html, tags, category, blog_config):
     """
     네이버 블로그에 글 포스팅
     blog_config: BLOGS dict의 개별 블로그 설정
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ]
-        )
+        browser, browser_type = await _launch_browser(p)
+
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent=ua if browser_type == "chromium" else None,
             locale="ko-KR",
         )
 
