@@ -202,7 +202,7 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             blog_id = blog_config["blog_id"]
             write_url = f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}"
             await page.goto(write_url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(4000)
+            await page.wait_for_timeout(5000)
 
             if len(context.pages) > 1:
                 page = context.pages[-1]
@@ -210,6 +210,18 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
                 await page.wait_for_timeout(3000)
 
             logger.info(f"[{blog_config['name']}] 글쓰기 페이지: {page.url}")
+
+            # mainFrame 로드 대기
+            main_frame = page.frame(name="mainFrame")
+            if main_frame:
+                try:
+                    await main_frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                    await page.wait_for_timeout(2000)
+                    logger.info("mainFrame 로드 완료")
+                except Exception:
+                    logger.warning("mainFrame 로드 대기 실패, 계속 진행")
+            else:
+                logger.warning("mainFrame 없음, 계속 진행")
 
             # 4. 제목 입력
             await _enter_title(page, title)
@@ -249,93 +261,90 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 # ─────────────────────────────────────────
 
 async def _enter_title(page, title):
-    """제목 입력 - SmartEditor ONE: contenteditable이므로 keyboard.type() 사용"""
-    # iframe 안에서 먼저 탐색 (SmartEditor ONE은 iframe 안에 있음)
-    for frame in page.frames:
-        try:
-            for sel in [".se-title-input", "div[contenteditable][class*='title']"]:
+    """제목 입력 - SmartEditor ONE (mainFrame → child frames 순으로 탐색)"""
+    title_selectors = [
+        ".se-title-input",
+        ".se-title__input",
+        "div[contenteditable][class*='title']",
+    ]
+
+    # mainFrame 직접 접근 후 child frames 포함 탐색
+    main_frame = page.frame(name="mainFrame")
+    search_frames = []
+    if main_frame:
+        search_frames.append(main_frame)
+        search_frames.extend(main_frame.child_frames)
+    # 나머지 frames fallback
+    for f in page.frames:
+        if f not in search_frames:
+            search_frames.append(f)
+
+    for frame in search_frames:
+        for sel in title_selectors:
+            try:
                 el = await frame.query_selector(sel)
                 if el:
                     await el.click()
-                    await frame.wait_for_timeout(300)
-                    await frame.keyboard.press("Control+a")
-                    await frame.keyboard.type(title)
-                    logger.info(f"제목 입력(iframe): {title[:30]}")
+                    await page.wait_for_timeout(300)
+                    await page.keyboard.press("Control+a")
+                    await page.keyboard.type(title)
+                    logger.info(f"제목 입력: {title[:30]}")
                     return
-        except Exception:
-            continue
-
-    # 메인 페이지에서 시도
-    for sel in [".se-title-input", "input[placeholder*='제목']", "#post-title input"]:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                await el.click()
-                await page.wait_for_timeout(300)
-                await page.keyboard.press("Control+a")
-                await page.keyboard.type(title)
-                logger.info(f"제목 입력: {title[:30]}")
-                return
-        except Exception:
-            continue
+            except Exception:
+                continue
 
     logger.warning("제목 입력 실패")
 
 
 async def _enter_content(page, content_html):
-    """본문 입력 - SmartEditor"""
-    selectors = [
-        ".se-content",
-        ".se2_inputarea",
-        "[contenteditable='true']",
-        "#smarteditor",
-    ]
-    safe_html = content_html.replace("`", "'").replace("\n", "")
+    """본문 입력 - SmartEditor ONE (body[contenteditable] 우선 탐색)"""
+    safe_html = content_html.replace("`", "'").replace("\\", "\\\\").replace("\n", "")
 
-    for selector in selectors:
-        try:
-            el = await page.query_selector(selector)
-            if el:
-                await el.click()
-                await page.wait_for_timeout(500)
-                js = f"""
-                    (function() {{
-                        var el = document.querySelector('{selector}');
-                        if (el) {{ el.innerHTML = `{safe_html}`; return true; }}
-                        return false;
-                    }})()
-                """
-                result = await page.evaluate(js)
-                if result:
-                    logger.info("본문 입력 완료")
-                    return
-        except Exception:
-            continue
+    main_frame = page.frame(name="mainFrame")
+    search_frames = []
+    if main_frame:
+        search_frames.append(main_frame)
+        search_frames.extend(main_frame.child_frames)
+    for f in page.frames:
+        if f not in search_frames:
+            search_frames.append(f)
 
-    for frame in page.frames:
+    for frame in search_frames:
         try:
             result = await frame.evaluate(f"""
                 (function() {{
-                    // 본문 영역: .se-content 안 또는 마지막 contenteditable (제목 제외)
-                    var body = document.querySelector('.se-content');
-                    if (body) {{
-                        var el = body.querySelector('[contenteditable]');
-                        if (el) {{ el.innerHTML = `{safe_html}`; return true; }}
+                    // 1) body 자체가 contenteditable인 경우 (SmartEditor 내부 편집 frame)
+                    if (document.body && document.body.contentEditable === 'true') {{
+                        document.body.innerHTML = `{safe_html}`;
+                        document.body.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        return 'body-editable';
                     }}
-                    var editables = document.querySelectorAll('[contenteditable="true"]');
-                    if (editables.length >= 2) {{
-                        editables[editables.length - 1].innerHTML = `{safe_html}`;
-                        return true;
+                    // 2) .se-content 내 editable 영역
+                    var seContent = document.querySelector('.se-content');
+                    if (seContent) {{
+                        var editable = seContent.querySelector('[contenteditable="true"]');
+                        if (editable) {{
+                            editable.innerHTML = `{safe_html}`;
+                            editable.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            return 'se-content';
+                        }}
                     }}
-                    if (editables.length === 1) {{
-                        editables[0].innerHTML = `{safe_html}`;
-                        return true;
+                    // 3) 제목 제외 마지막 contenteditable
+                    var all = Array.from(document.querySelectorAll('[contenteditable="true"]'));
+                    var nonTitle = all.filter(function(el) {{
+                        return !el.className.includes('title') && el.tagName !== 'INPUT';
+                    }});
+                    if (nonTitle.length > 0) {{
+                        var target = nonTitle[nonTitle.length - 1];
+                        target.innerHTML = `{safe_html}`;
+                        target.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        return 'last-editable';
                     }}
                     return false;
                 }})()
             """)
             if result:
-                logger.info("본문 입력 완료(iframe)")
+                logger.info(f"본문 입력 완료: {result}")
                 return
         except Exception:
             continue
@@ -368,17 +377,27 @@ async def _enter_tags(page, tags):
 
 async def _publish(page):
     """발행 버튼 클릭 - SmartEditor ONE"""
-    # 1단계: 발행 버튼 클릭
     publish_selectors = [
-        "button.se-btn-publish-cancel",
+        "button.se-btn-publish",
         "button[class*='publish']",
-        ".se_publish",
-        ".btn_publish",
         "button:has-text('발행')",
+        ".btn_publish",
+        ".se_publish",
         "a:has-text('발행')",
         "button:has-text('게시')",
         "#publish-btn",
     ]
+
+    main_frame = page.frame(name="mainFrame")
+    search_frames = []
+    if main_frame:
+        search_frames.append(main_frame)
+        search_frames.extend(main_frame.child_frames)
+    for f in page.frames:
+        if f not in search_frames:
+            search_frames.append(f)
+
+    # 1단계: 발행 버튼 (메인 페이지 → frames 순)
     clicked = False
     for sel in publish_selectors:
         try:
@@ -392,15 +411,14 @@ async def _publish(page):
         except Exception:
             continue
 
-    # iframe 안에서도 탐색
     if not clicked:
-        for frame in page.frames:
-            for sel in ["button:has-text('발행')", "button[class*='publish']", ".btn_publish"]:
+        for frame in search_frames:
+            for sel in publish_selectors:
                 try:
                     el = await frame.query_selector(sel)
                     if el:
                         await el.click()
-                        logger.info(f"발행 버튼 클릭(iframe): {sel}")
+                        logger.info(f"발행 버튼 클릭(frame): {sel}")
                         await page.wait_for_timeout(3000)
                         clicked = True
                         break
@@ -413,17 +431,18 @@ async def _publish(page):
         logger.error("발행 버튼 없음")
         return False
 
-    # 2단계: 확인/공개발행 모달 처리
-    for confirm in [
+    # 2단계: 확인/공개발행 모달
+    confirm_selectors = [
         "button:has-text('공개발행')",
         "button:has-text('전체공개')",
         "button:has-text('확인')",
         ".btn_confirm",
         ".btn_ok",
-    ]:
+    ]
+    for sel in confirm_selectors:
         try:
-            await page.click(confirm, timeout=3000)
-            logger.info(f"발행 확인: {confirm}")
+            await page.click(sel, timeout=3000)
+            logger.info(f"발행 확인: {sel}")
             await page.wait_for_timeout(2000)
             return True
         except Exception:
