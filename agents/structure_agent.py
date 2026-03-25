@@ -4,7 +4,8 @@
 모델: google/gemma-3-27b-it:free (HTML 포맷팅 특화)
 """
 import json
-from typing import Optional, Union
+import re
+from typing import Optional
 import logging
 import sys
 import os
@@ -18,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 # 박스 유형별 스타일
 BOX_STYLES = {
-    "info": "background:#EBF5FB;border-left:5px solid #2E86C1;padding:16px 20px;margin:20px 0;border-radius:0 8px 8px 0;",
-    "tip":  "background:#E9F7EF;border:1px solid #27AE60;padding:16px 20px;margin:20px 0;border-radius:8px;",
+    "info":    "background:#EBF5FB;border-left:5px solid #2E86C1;padding:16px 20px;margin:20px 0;border-radius:0 8px 8px 0;",
+    "tip":     "background:#E9F7EF;border:1px solid #27AE60;padding:16px 20px;margin:20px 0;border-radius:8px;",
     "warning": "background:#FDEDEC;border-left:5px solid #E74C3C;padding:16px 20px;margin:20px 0;border-radius:0 8px 8px 0;",
 }
 BASE_FONT = "font-family:'Nanum Gothic','맑은 고딕',sans-serif;"
@@ -49,15 +50,13 @@ class StructureAgent(BaseAgent):
             {title, title_alt, content_html, tags_hash, tags_comma,
              tags_plain, tags, meta_description}
         """
-        # 태그 조합 (한국어 15 + 영어 10)
+        # 태그는 Python에서 직접 조립 (모델에게 맡기지 않음)
         tags_ko  = content_data.get("tags_ko", [])[:15]
         tags_en  = content_data.get("tags_en", [])[:10]
         all_tags = tags_ko + tags_en
 
-        # 이미지 HTML
         img_html = self._build_image_html(image_url, image_alt)
 
-        # 박스 HTML 미리 빌드 (프롬프트 명확성 향상)
         boxes_hint = "\n".join([
             f'  - info:    <div style="{BOX_STYLES["info"]}{BASE_FONT}">',
             f'  - tip:     <div style="{BOX_STYLES["tip"]}{BASE_FONT}">',
@@ -79,7 +78,7 @@ class StructureAgent(BaseAgent):
             },
             {
                 "role": "user",
-                "content": f"""다음 콘텐츠 데이터를 완성된 네이버 블로그 HTML로 변환하세요.
+                "content": f"""다음 콘텐츠 데이터를 네이버 블로그 HTML로 변환하세요.
 
 ━━ 콘텐츠 데이터 ━━
 {json.dumps(content_data, ensure_ascii=False, indent=2)}
@@ -104,44 +103,57 @@ class StructureAgent(BaseAgent):
 [E] 본문 섹션들 (main_points 기반, 각 섹션마다 h2 + 내용 + 해당 box_type 박스)
     h2 style: font-size:22px;font-weight:bold;color:#1a1a2e;border-bottom:3px solid #3498DB;padding-bottom:10px;margin:35px 0 15px;{BASE_FONT}
 [F] 비교 표 (comparison_data 활용)
-    헤더: background:#2C3E50;color:white;padding:12px 14px;text-align:center;border:1px solid #ddd;
-    짝수행: background:#F8F9FA; 홀수행: background:#ffffff;
-    td: padding:11px 14px;border:1px solid #ddd;vertical-align:middle;
 [G] FAQ 섹션
-    각 Q: h3 style="font-size:17px;font-weight:bold;color:#2C3E50;margin:20px 0 8px;"
-    각 A: p style="color:#555;line-height:1.8;margin:0 0 15px;"
 [H] 결론 + CTA (tip 스타일 div)
-[I] 출처: {article_link or ''}
-    <p style="font-size:13px;color:#888;border-top:1px solid #eee;margin-top:30px;padding-top:15px;">
-    📌 <strong>정보 출처:</strong> <a href="{article_link}" target="_blank" style="color:#3498DB;">{article_link}</a></p>
+[I] 출처 링크: {article_link or ''}
 
 <hr style="border:none;border-top:2px solid #EAECEE;margin:35px 0;"> 로 섹션 구분.
 
-최종 JSON으로만 반환:
-{{
-  "content_html": "완성된 HTML 전체 (위 [A]~[I] 포함, 길이 제한 없음)",
-  "tags_hash": "{' '.join('#' + t for t in all_tags)}",
-  "tags_comma": "{', '.join(all_tags)}",
-  "tags_plain": "{' '.join(all_tags)}",
-  "tags": "{','.join(all_tags)}",
-  "meta_description": "검색 노출용 설명 140자 이내 (핵심 키워드 포함)"
-}}
+━━ 응답 형식 (반드시 이 구분자 사용) ━━
+---HTML---
+(완성된 HTML 전체를 여기에)
+---META---
+(검색 노출용 설명 140자 이내, 핵심 키워드 포함)
+---END---
 
-content_html은 반드시 완전한 HTML이어야 합니다. JSON 외 텍스트 절대 금지.""",
+HTML 외 설명 텍스트 절대 금지.""",
             },
         ]
 
-        result = self.chat_json(messages, max_tokens=10000)
+        raw = self.chat(messages, max_tokens=8000)
+        if not raw:
+            logger.error("[StructureAgent] HTML 구성 실패")
+            return None
 
-        if isinstance(result, dict) and result.get("content_html"):
-            # 제목 필드 추가
-            result["title"]     = content_data.get("title", "")
-            result["title_alt"] = content_data.get("title_alt", "")
-            logger.info(f"[StructureAgent] HTML 구성 완료 ({len(result['content_html'])}자)")
-            return result
+        # 구분자로 HTML과 meta_description 추출
+        html_match = re.search(r"---HTML---\s*(.*?)\s*---META---", raw, re.DOTALL)
+        meta_match = re.search(r"---META---\s*(.*?)\s*---END---", raw, re.DOTALL)
 
-        logger.error("[StructureAgent] HTML 구성 실패")
-        return None
+        if not html_match:
+            # 구분자 없으면 전체를 HTML로 사용
+            content_html = raw.strip()
+        else:
+            content_html = html_match.group(1).strip()
+
+        meta_description = meta_match.group(1).strip() if meta_match else ""
+
+        if not content_html:
+            logger.error("[StructureAgent] HTML 내용 없음")
+            return None
+
+        # 태그 필드 Python에서 직접 조립
+        result = {
+            "title":           content_data.get("title", ""),
+            "title_alt":       content_data.get("title_alt", ""),
+            "content_html":    content_html,
+            "tags_hash":       " ".join("#" + t for t in all_tags),
+            "tags_comma":      ", ".join(all_tags),
+            "tags_plain":      " ".join(all_tags),
+            "tags":            ",".join(all_tags),
+            "meta_description": meta_description,
+        }
+        logger.info(f"[StructureAgent] HTML 구성 완료 ({len(content_html)}자)")
+        return result
 
     @staticmethod
     def _build_image_html(image_url: str, image_alt: str) -> str:
@@ -150,8 +162,8 @@ content_html은 반드시 완전한 HTML이어야 합니다. JSON 외 텍스트 
         return (
             f'<div style="text-align:center;margin:0 0 30px;">'
             f'<img src="{image_url}" alt="{image_alt}" '
-            f"style=\"max-width:100%;height:auto;border-radius:12px;"
-            f'box-shadow:0 4px 16px rgba(0,0,0,0.15);\">'
+            f'style="max-width:100%;height:auto;border-radius:12px;'
+            f'box-shadow:0 4px 16px rgba(0,0,0,0.15);">'
             f'<p style="font-size:13px;color:#888;margin-top:8px;'
             f"font-family:'Nanum Gothic','맑은 고딕',sans-serif;\">{image_alt}</p>"
             f"</div>"
