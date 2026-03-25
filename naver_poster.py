@@ -116,25 +116,48 @@ async def login_with_password(page, blog_config):
 # 메인 포스팅 함수
 # ─────────────────────────────────────────
 
+class BrowserUnavailableError(RuntimeError):
+    """시스템 라이브러리 부족으로 브라우저를 실행할 수 없을 때"""
+    pass
+
+
+def _is_missing_lib_error(e: Exception) -> bool:
+    msg = str(e)
+    return any(k in msg for k in ("shared libraries", "exitCode=127", "libatk", "libgtk", "exitCode=255", "libmoz"))
+
+
 async def _launch_browser(p):
-    """Chromium 실행 시도 → 라이브러리 오류 시 Firefox로 폴백"""
+    """Chromium → Firefox 순으로 시도, 둘 다 실패 시 BrowserUnavailableError"""
     chromium_args = [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
     ]
+    # 1) Chromium
     try:
         browser = await p.chromium.launch(headless=HEADLESS, args=chromium_args)
         logger.info("브라우저: Chromium")
         return browser, "chromium"
     except Exception as e:
-        if "shared libraries" in str(e) or "exitCode=127" in str(e) or "libatk" in str(e):
-            logger.warning(f"Chromium 실행 실패 (시스템 라이브러리 부족), Firefox로 전환: {e}")
-            browser = await p.firefox.launch(headless=HEADLESS)
-            logger.info("브라우저: Firefox")
-            return browser, "firefox"
-        raise
+        if not _is_missing_lib_error(e):
+            raise
+        logger.warning("Chromium 라이브러리 없음, Firefox 시도 중...")
+
+    # 2) Firefox
+    try:
+        browser = await p.firefox.launch(headless=HEADLESS)
+        logger.info("브라우저: Firefox")
+        return browser, "firefox"
+    except Exception as e:
+        if not _is_missing_lib_error(e):
+            raise
+        raise BrowserUnavailableError(
+            "Chromium/Firefox 모두 실행 불가. GTK3 라이브러리가 없습니다.\n"
+            "Synology NAS에서 Entware가 설치되어 있다면:\n"
+            "  opkg update && opkg install libgtk3 libatk\n"
+            "또는 DSM 패키지 센터에서 필요한 라이브러리를 설치하세요."
+        ) from e
 
 
 async def post_to_naver_blog(title, content_html, tags, category, blog_config):

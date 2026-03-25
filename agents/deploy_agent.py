@@ -15,7 +15,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.base_agent import BaseAgent, LLAMA_70B, HERMES_405B
-from naver_poster import post_blog, save_post_locally
+from naver_poster import post_blog, save_post_locally, BrowserUnavailableError
 from config import BLOGS, GMAIL_ADDRESS, GMAIL_APP_PASSWORD
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,18 @@ class DeployAgent(BaseAgent):
                     return {"success": True, "attempts": attempt, "message": "게시 완료"}
 
                 last_error = "post_blog 반환값 False (로그인 실패 또는 UI 변경 가능성)"
+
+            except BrowserUnavailableError as e:
+                # 시스템 라이브러리 없음 → 재시도해도 소용없음, 즉시 로컬 저장
+                last_error = str(e)
+                logger.error(f"[DeployAgent] ❌ 브라우저 실행 불가 — 재시도 없이 로컬 저장:\n{e}")
+                save_post_locally(title, content_html, tags, category, blog_cfg)
+                self._alert_failure(blog_name, title, category, last_error)
+                return {
+                    "success": False,
+                    "attempts": attempt,
+                    "message": f"브라우저 라이브러리 없음. drafts/ 저장됨. {last_error}",
+                }
 
             except Exception as e:
                 last_error = str(e)
