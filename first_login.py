@@ -1,10 +1,8 @@
 """
-최초 1회 수동 로그인 스크립트
+최초 1회 자동 로그인 스크립트 (headless)
 ────────────────────────────────────────────────
-이 파일은 각 블로그 계정마다 처음 딱 한 번 실행합니다.
-브라우저 창이 열리면 직접 네이버에 로그인하세요.
-로그인 완료 후 Enter를 누르면 쿠키가 저장됩니다.
-이후부터는 자동으로 쿠키를 사용해서 로그인합니다.
+.env의 ID/PW로 자동 로그인 후 쿠키를 저장합니다.
+이후 자동화에서는 저장된 쿠키를 사용합니다.
 ────────────────────────────────────────────────
 """
 import asyncio
@@ -14,24 +12,18 @@ from playwright.async_api import async_playwright
 from config import BLOGS
 
 
-async def manual_login(blog_config):
+async def auto_login(blog_config):
     blog_name = blog_config["name"]
+    naver_id  = blog_config["naver_id"]
+    naver_pw  = blog_config["naver_pw"]
     cookie_file = blog_config["cookie_file"]
 
-    print("=" * 50)
-    print(f"  [{blog_name}] 네이버 최초 로그인")
-    print("=" * 50)
-    print()
-    print(f"계정 ID: {blog_config['naver_id']}")
-    print("잠시 후 브라우저 창이 열립니다.")
-    print("네이버에 직접 로그인해 주세요.")
-    print("로그인 완료 후 이 창으로 돌아와서 Enter를 누르세요.")
-    print()
+    print(f"\n[{blog_name}] 자동 로그인 시작 (ID: {naver_id})")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,
-            args=["--no-sandbox", "--start-maximized"]
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
@@ -40,39 +32,60 @@ async def manual_login(blog_config):
         )
         page = await context.new_page()
 
-        await page.goto("https://nid.naver.com/nidlogin.login")
-        print("✅ 브라우저가 열렸습니다. 로그인해 주세요.")
-        print()
+        try:
+            await page.goto("https://nid.naver.com/nidlogin.login", wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
 
-        input("로그인 완료 후 여기서 Enter를 누르세요...")
+            # ID 입력 (자연스러운 타이핑으로 봇 감지 우회)
+            await page.click("#id")
+            await page.wait_for_timeout(500)
+            for char in naver_id:
+                await page.type("#id", char, delay=80)
+            await page.wait_for_timeout(700)
 
-        await page.goto("https://www.naver.com")
-        await page.wait_for_timeout(2000)
+            # PW 입력
+            await page.click("#pw")
+            await page.wait_for_timeout(500)
+            for char in naver_pw:
+                await page.type("#pw", char, delay=80)
+            await page.wait_for_timeout(700)
 
-        content = await page.content()
-        naver_id = blog_config["naver_id"].lower()
-        if "로그아웃" in content or "내정보" in content or naver_id in content.lower():
-            cookies = await context.cookies()
-            with open(cookie_file, "w", encoding="utf-8") as f:
-                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            # 로그인 버튼
+            await page.click(".btn_login")
+            await page.wait_for_timeout(5000)
 
-            print()
-            print("=" * 50)
-            print(f"✅ [{blog_name}] 로그인 성공! 쿠키 저장 완료.")
-            print(f"   저장 위치: {cookie_file}")
-            print("=" * 50)
-            result = True
-        else:
-            print()
-            print(f"❌ [{blog_name}] 로그인이 확인되지 않습니다.")
-            result = False
+            current_url = page.url
+            if "nidlogin" in current_url:
+                print(f"❌ [{blog_name}] 로그인 실패 — 캡차 또는 계정 오류")
+                print("   → Naver에서 새 기기 로그인 차단 중일 수 있습니다.")
+                print("   → naver.com에서 직접 로그인 후 '이 기기 신뢰'를 선택해 주세요.")
+                await browser.close()
+                return False
 
-        await browser.close()
-        return result
+            # 로그인 확인
+            await page.goto("https://www.naver.com", wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+            content = await page.content()
+
+            if "로그아웃" in content or naver_id.lower() in content.lower():
+                cookies = await context.cookies()
+                with open(cookie_file, "w", encoding="utf-8") as f:
+                    json.dump(cookies, f, ensure_ascii=False, indent=2)
+                print(f"✅ [{blog_name}] 로그인 성공! 쿠키 저장: {cookie_file}")
+                await browser.close()
+                return True
+            else:
+                print(f"❌ [{blog_name}] 로그인 확인 실패 (보안 문자 등)")
+                await browser.close()
+                return False
+
+        except Exception as e:
+            print(f"❌ [{blog_name}] 오류: {e}")
+            await browser.close()
+            return False
 
 
 async def run_all_logins(target_blog=None):
-    """모든 블로그(또는 특정 블로그)에 대해 순서대로 로그인"""
     blogs_to_login = {}
 
     if target_blog:
@@ -83,36 +96,22 @@ async def run_all_logins(target_blog=None):
             print(f"   사용 가능한 블로그: {', '.join(BLOGS.keys())}")
             return
     else:
-        blogs_to_login = BLOGS
+        blogs_to_login = {k: v for k, v in BLOGS.items() if v.get("naver_id")}
 
-    print(f"\n총 {len(blogs_to_login)}개 블로그 로그인을 진행합니다.\n")
+    print(f"\n총 {len(blogs_to_login)}개 블로그 자동 로그인을 진행합니다.")
 
     for blog_key, blog_config in blogs_to_login.items():
-        if not blog_config.get("naver_id"):
-            print(f"⚠️  [{blog_config['name']}] .env에 {blog_key.upper()} 계정 설정이 없습니다. 스킵.")
-            continue
-
-        success = await manual_login(blog_config)
+        success = await auto_login(blog_config)
         if not success:
-            print(f"   다시 시도: python first_login.py --blog {blog_key}")
+            print(f"   재시도: python first_login.py --blog {blog_key}")
 
-        if len(blogs_to_login) > 1:
-            print("\n다음 블로그 로그인을 진행합니다...")
-            print()
-
-    print("\n모든 로그인 완료!")
-    print("  테스트: python scheduler.py --test")
+    print("\n완료!")
     print("  즉시실행: python scheduler.py --now")
     print("  자동실행: python scheduler.py")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="네이버 블로그 최초 로그인")
-    parser.add_argument(
-        "--blog",
-        type=str,
-        help=f"특정 블로그만 로그인. 선택 가능: {', '.join(BLOGS.keys())}",
-    )
+    parser = argparse.ArgumentParser(description="네이버 블로그 자동 로그인 및 쿠키 저장")
+    parser.add_argument("--blog", type=str, help=f"특정 블로그만: {', '.join(BLOGS.keys())}")
     args = parser.parse_args()
-
     asyncio.run(run_all_logins(args.blog))
