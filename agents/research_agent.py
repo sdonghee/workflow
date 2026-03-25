@@ -7,6 +7,7 @@ import logging
 import sys
 import os
 from datetime import date
+from typing import List, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,7 +27,7 @@ class ResearchAgent(BaseAgent):
             fallback_models=[HERMES_405B],
         )
 
-    def get_articles(self, category: str, max_count: int = 5) -> list[dict]:
+    def get_articles(self, category: str, max_count: int = 5) -> List[dict]:
         """
         카테고리별 기사 수집.
         실제 RSS/뉴스 수집 → 부족하면 AI가 주제 생성 → 각 기사 전문 보강.
@@ -63,7 +64,7 @@ class ResearchAgent(BaseAgent):
         logger.info(f"[ResearchAgent] '{category}': {len(enriched)}개 준비 완료")
         return enriched
 
-    def _generate_topics(self, category: str, count: int) -> list[dict]:
+    def _generate_topics(self, category: str, count: int) -> List[dict]:
         """기사가 없을 때 AI가 한국 트렌드 기반으로 주제 직접 생성"""
         cat_cfg  = CATEGORIES.get(category, {})
         keywords = cat_cfg.get("keywords", [category])[:6]

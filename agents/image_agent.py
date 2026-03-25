@@ -9,6 +9,7 @@ import random
 import urllib.parse
 import sys
 import os
+from typing import Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,7 +28,7 @@ class ImageAgent(BaseAgent):
             fallback_models=[LLAMA_70B],
         )
 
-    def get_image(self, topic: str, category: str) -> tuple[str, str, str]:
+    def get_image(self, topic: str, category: str) -> Tuple[str, str, str]:
         """
         주제에 맞는 이미지 URL, alt 텍스트, 크레딧 반환.
         Unsplash → Pexels → Pixabay → Pollinations.ai 순서로 시도.
@@ -83,7 +84,7 @@ class ImageAgent(BaseAgent):
 
     def _generate_with_pollinations(
         self, topic: str, category: str
-    ) -> tuple[str, str, str]:
+    ) -> Tuple[str, str, str]:
         """
         Pollinations.ai로 AI 이미지 생성.
         URL 형식: https://image.pollinations.ai/prompt/{encoded}?width=1200&height=630&nologo=true

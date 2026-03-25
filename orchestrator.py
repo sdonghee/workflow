@@ -12,6 +12,7 @@ import random
 import re
 import time
 from datetime import date, datetime
+from typing import List, Dict
 
 import anthropic
 
@@ -66,12 +67,12 @@ class BlogOrchestrator:
         self.image    = ImageAgent()
         self.structure = StructureAgent()
         self.deploy   = DeployAgent()
-        self._results: list[dict] = []
+        self._results: List[dict] = []
 
     # ═══════════════════════════════════════════════════════════════
     # STEP 1: Claude가 오늘의 포스팅 계획 수립
     # ═══════════════════════════════════════════════════════════════
-    def plan_session(self) -> list[dict]:
+    def plan_session(self) -> List[dict]:
         """
         Claude API를 사용해 오늘의 포스팅 계획 생성.
 
@@ -144,7 +145,7 @@ JSON 배열만 반환 (다른 텍스트 없음):
             logger.error(f"[Orchestrator] 계획 수립 실패: {e} — 폴백 계획 사용")
             return self._fallback_plan(valid_blogs)
 
-    def _fallback_plan(self, blogs: dict) -> list[dict]:
+    def _fallback_plan(self, blogs: dict) -> List[dict]:
         """Claude 실패 시 config 기반 기본 계획"""
         plan, priority = [], 1
         for key, cfg in blogs.items():
