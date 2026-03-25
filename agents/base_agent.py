@@ -7,6 +7,7 @@ import logging
 import re
 import sys
 import os
+from typing import Optional, Union, List, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -41,7 +42,7 @@ class BaseAgent:
         messages: list,
         max_tokens: int = 4096,
         temperature: float = 0.7,
-    ) -> str | None:
+    ) -> Optional[str]:
         """
         요청 전송. 실패 시 fallback_models 순서대로 재시도.
         Returns: 응답 텍스트 또는 None
@@ -67,7 +68,7 @@ class BaseAgent:
         return None
 
     # ── JSON 응답 편의 메서드 ─────────────────────────────────────
-    def chat_json(self, messages: list, max_tokens: int = 4096) -> dict | list | None:
+    def chat_json(self, messages: list, max_tokens: int = 4096) -> Optional[Union[Dict, List]]:
         """
         JSON 응답 요청. ```json 펜스 및 순수 { } / [ ] 모두 처리.
         """

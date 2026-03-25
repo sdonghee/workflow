@@ -3,6 +3,7 @@
 기사를 깊이 있는 블로그 콘텐츠(구조화된 정보)로 변환
 모델: Nous Hermes 405B → Llama 3.3 70B → Gemma 3 27B (폴백 순서)
 """
+from typing import Optional, Union
 import logging
 import sys
 import os
@@ -27,7 +28,7 @@ class ContentAgent(BaseAgent):
             fallback_models=[LLAMA_70B, GEMMA_27B],
         )
 
-    def generate(self, article: dict, category: str) -> dict | None:
+    def generate(self, article: dict, category: str) -> Optional[dict]:
         """
         기사를 구조화된 블로그 콘텐츠 데이터로 변환.
         원본 기사보다 3배 풍부한 정보를 담는 것이 목표.

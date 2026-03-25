@@ -4,6 +4,7 @@
 모델: google/gemma-3-27b-it:free (HTML 포맷팅 특화)
 """
 import json
+from typing import Optional, Union
 import logging
 import sys
 import os
@@ -39,7 +40,7 @@ class StructureAgent(BaseAgent):
         image_url: str = "",
         image_alt: str = "",
         article_link: str = "",
-    ) -> dict | None:
+    ) -> Optional[dict]:
         """
         콘텐츠 데이터 + 이미지 URL → 완성된 네이버 블로그 HTML + 태그
 

@@ -3,6 +3,7 @@ AI 콘텐츠 생성 모듈
 OpenRouter API를 사용하여 저작권에 걸리지 않는 고품질 블로그 포스트를 생성합니다.
 """
 import json
+from typing import Optional, Union
 import logging
 import re
 
@@ -251,7 +252,7 @@ def _build_user_prompt(category: str, article: dict) -> str:
 """
 
 
-def generate_blog_post(category: str, article: dict, image_url: str = "", image_alt: str = "") -> dict | None:
+def generate_blog_post(category: str, article: dict, image_url: str = "", image_alt: str = "") -> Optional[dict]:
     """
     AI로 네이버 블로그 포스트 생성
 
@@ -340,7 +341,7 @@ HTML 코드만 반환하세요 (설명 없이).
         return ""
 
 
-def create_post_from_scratch(category: str, topic: str, category_config: dict) -> dict | None:
+def create_post_from_scratch(category: str, topic: str, category_config: dict) -> Optional[dict]:
     """
     특정 주제로 처음부터 블로그 포스트 생성 (참고 기사 없을 때)
     """
