@@ -1,6 +1,6 @@
 """
 에이전트 기반 클래스
-OpenRouter API 클라이언트 + 자동 폴백 로직 공통 제공
+Claude API (Anthropic) 클라이언트 + 자동 폴백 로직 공통 제공
 """
 import json
 import logging
@@ -11,30 +11,27 @@ from typing import Optional, Union, List, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from openai import OpenAI
-from config import OPENROUTER_API_KEY
+import anthropic
+from config import ANTHROPIC_API_KEY
 
 logger = logging.getLogger(__name__)
 
-# ─── OpenRouter 무료 모델 ID ────────────────────────────────────
-HERMES_405B = "nousresearch/hermes-3-llama-3.1-405b:free"
-LLAMA_70B   = "meta-llama/llama-3.3-70b-instruct:free"
-GEMMA_27B   = "google/gemma-3-27b-it:free"
+# ─── Claude 모델 ID ────────────────────────────────────────────
+HERMES_405B = "claude-sonnet-4-6"   # 기존 Hermes 역할 → Claude Sonnet
+LLAMA_70B   = "claude-haiku-4-5"    # 기존 Llama 역할  → Claude Haiku (폴백)
+GEMMA_27B   = "claude-haiku-4-5"    # 기존 Gemma 역할  → Claude Haiku (폴백)
 
 
 class BaseAgent:
-    """OpenRouter 기반 에이전트 공통 기반 클래스"""
+    """Claude API 기반 에이전트 공통 기반 클래스"""
 
     PRIMARY_MODEL   = HERMES_405B
-    FALLBACK_MODELS = [LLAMA_70B, GEMMA_27B]
+    FALLBACK_MODELS = [LLAMA_70B]
 
     def __init__(self, model: str = None, fallback_models: list = None):
-        self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=OPENROUTER_API_KEY,
-        )
+        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         self.primary_model   = model or self.PRIMARY_MODEL
-        self.fallback_models = fallback_models or self.FALLBACK_MODELS
+        self.fallback_models = fallback_models if fallback_models is not None else self.FALLBACK_MODELS
 
     # ── 핵심 메서드: 모델 폴백 포함 텍스트 응답 ──────────────────
     def chat(
@@ -47,17 +44,29 @@ class BaseAgent:
         요청 전송. 실패 시 fallback_models 순서대로 재시도.
         Returns: 응답 텍스트 또는 None
         """
+        # system 메시지 분리 (Anthropic API 형식)
+        system_prompt = None
+        user_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_prompt = msg["content"]
+            else:
+                user_messages.append(msg)
+
         models = [self.primary_model] + self.fallback_models
 
         for model in models:
             try:
-                resp = self.client.chat.completions.create(
+                kwargs = dict(
                     model=model,
                     max_tokens=max_tokens,
-                    temperature=temperature,
-                    messages=messages,
+                    messages=user_messages,
                 )
-                text = resp.choices[0].message.content
+                if system_prompt:
+                    kwargs["system"] = system_prompt
+
+                resp = self.client.messages.create(**kwargs)
+                text = resp.content[0].text if resp.content else None
                 if text and text.strip():
                     logger.debug(f"[{self.__class__.__name__}] 응답 성공 ({model})")
                     return text.strip()
