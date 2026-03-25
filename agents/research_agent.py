@@ -7,7 +7,7 @@ import logging
 import sys
 import os
 from datetime import date
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -117,7 +117,7 @@ JSON 배열로만 반환:
             for kw in keywords[:count]
         ]
 
-    def analyze_todays_trends(self, categories: list[str]) -> dict:
+    def analyze_todays_trends(self, categories: List[str]) -> dict:
         """
         오늘의 카테고리별 트렌드 키워드 분석.
         orchestrator가 계획 수립 시 참고용으로 호출.
