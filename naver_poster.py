@@ -249,28 +249,33 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 # ─────────────────────────────────────────
 
 async def _enter_title(page, title):
-    """제목 입력"""
-    selectors = [
-        ".se-title-input",
-        "#post-title .input_text",
-        "#post-title input",
-        "input[placeholder*='제목']",
-    ]
-    for selector in selectors:
+    """제목 입력 - SmartEditor ONE: contenteditable이므로 keyboard.type() 사용"""
+    # iframe 안에서 먼저 탐색 (SmartEditor ONE은 iframe 안에 있음)
+    for frame in page.frames:
         try:
-            await page.click(selector, timeout=4000)
-            await page.fill(selector, title)
-            logger.info(f"제목 입력: {title[:30]}")
-            return
+            for sel in [".se-title-input", "div[contenteditable][class*='title']"]:
+                el = await frame.query_selector(sel)
+                if el:
+                    await el.click()
+                    await frame.wait_for_timeout(300)
+                    await frame.keyboard.press("Control+a")
+                    await frame.keyboard.type(title)
+                    logger.info(f"제목 입력(iframe): {title[:30]}")
+                    return
         except Exception:
             continue
 
-    for frame in page.frames:
+    # 메인 페이지에서 시도
+    for sel in [".se-title-input", "input[placeholder*='제목']", "#post-title input"]:
         try:
-            await frame.click("input[placeholder*='제목']", timeout=2000)
-            await frame.fill("input[placeholder*='제목']", title)
-            logger.info(f"제목 입력(iframe): {title[:30]}")
-            return
+            el = await page.query_selector(sel)
+            if el:
+                await el.click()
+                await page.wait_for_timeout(300)
+                await page.keyboard.press("Control+a")
+                await page.keyboard.type(title)
+                logger.info(f"제목 입력: {title[:30]}")
+                return
         except Exception:
             continue
 
@@ -309,10 +314,27 @@ async def _enter_content(page, content_html):
 
     for frame in page.frames:
         try:
-            el = await frame.query_selector("[contenteditable='true']")
-            if el:
-                await el.click()
-                await frame.evaluate(f"document.querySelector('[contenteditable]').innerHTML = `{safe_html}`")
+            result = await frame.evaluate(f"""
+                (function() {{
+                    // 본문 영역: .se-content 안 또는 마지막 contenteditable (제목 제외)
+                    var body = document.querySelector('.se-content');
+                    if (body) {{
+                        var el = body.querySelector('[contenteditable]');
+                        if (el) {{ el.innerHTML = `{safe_html}`; return true; }}
+                    }}
+                    var editables = document.querySelectorAll('[contenteditable="true"]');
+                    if (editables.length >= 2) {{
+                        editables[editables.length - 1].innerHTML = `{safe_html}`;
+                        return true;
+                    }}
+                    if (editables.length === 1) {{
+                        editables[0].innerHTML = `{safe_html}`;
+                        return true;
+                    }}
+                    return false;
+                }})()
+            """)
+            if result:
                 logger.info("본문 입력 완료(iframe)")
                 return
         except Exception:
@@ -345,32 +367,71 @@ async def _enter_tags(page, tags):
 
 
 async def _publish(page):
-    """발행 버튼 클릭"""
-    selectors = [
+    """발행 버튼 클릭 - SmartEditor ONE"""
+    # 1단계: 발행 버튼 클릭
+    publish_selectors = [
+        "button.se-btn-publish-cancel",
+        "button[class*='publish']",
+        ".se_publish",
         ".btn_publish",
         "button:has-text('발행')",
-        "button:has-text('공개발행')",
+        "a:has-text('발행')",
+        "button:has-text('게시')",
         "#publish-btn",
     ]
-    for selector in selectors:
+    clicked = False
+    for sel in publish_selectors:
         try:
-            await page.click(selector, timeout=4000)
-            await page.wait_for_timeout(3000)
+            el = await page.query_selector(sel)
+            if el:
+                await el.click()
+                logger.info(f"발행 버튼 클릭: {sel}")
+                await page.wait_for_timeout(3000)
+                clicked = True
+                break
+        except Exception:
+            continue
 
-            for confirm in ["button:has-text('확인')", ".btn_confirm", ".btn_ok"]:
+    # iframe 안에서도 탐색
+    if not clicked:
+        for frame in page.frames:
+            for sel in ["button:has-text('발행')", "button[class*='publish']", ".btn_publish"]:
                 try:
-                    await page.click(confirm, timeout=2000)
-                    break
+                    el = await frame.query_selector(sel)
+                    if el:
+                        await el.click()
+                        logger.info(f"발행 버튼 클릭(iframe): {sel}")
+                        await page.wait_for_timeout(3000)
+                        clicked = True
+                        break
                 except Exception:
                     continue
+            if clicked:
+                break
 
+    if not clicked:
+        logger.error("발행 버튼 없음")
+        return False
+
+    # 2단계: 확인/공개발행 모달 처리
+    for confirm in [
+        "button:has-text('공개발행')",
+        "button:has-text('전체공개')",
+        "button:has-text('확인')",
+        ".btn_confirm",
+        ".btn_ok",
+    ]:
+        try:
+            await page.click(confirm, timeout=3000)
+            logger.info(f"발행 확인: {confirm}")
             await page.wait_for_timeout(2000)
             return True
         except Exception:
             continue
 
-    logger.error("발행 버튼 없음")
-    return False
+    # 확인 버튼 없어도 발행된 경우
+    await page.wait_for_timeout(2000)
+    return True
 
 
 # ─────────────────────────────────────────
