@@ -18,6 +18,8 @@ PIXABAY_API_KEY     = os.getenv("PIXABAY_API_KEY", "")    # Agent 4 이미지 3�
 # ── 검색 API ─────────────────────────────────────────────────────
 GOOGLE_SEARCH_API_KEY    = os.getenv("GOOGLE_SEARCH_API_KEY", "")
 GOOGLE_SEARCH_ENGINE_ID  = os.getenv("GOOGLE_SEARCH_ENGINE_ID", "")
+NAVER_CLIENT_ID          = os.getenv("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET      = os.getenv("NAVER_CLIENT_SECRET", "")
 
 # ── 알림 (Gmail SMTP) ────────────────────────────────────────────
 GMAIL_ADDRESS      = os.getenv("GMAIL_ADDRESS", "")       # Agent 5 실패 알림
