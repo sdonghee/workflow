@@ -69,18 +69,6 @@ class DeployAgent(BaseAgent):
 
                 last_error = "post_blog 반환값 False (로그인 실패 또는 UI 변경 가능성)"
 
-            except BrowserUnavailableError as e:
-                # 시스템 라이브러리 없음 → 재시도해도 소용없음, 즉시 로컬 저장
-                last_error = str(e)
-                logger.error(f"[DeployAgent] ❌ 브라우저 실행 불가 — 재시도 없이 로컬 저장:\n{e}")
-                save_post_locally(title, content_html, tags, category, blog_cfg)
-                self._alert_failure(blog_name, title, category, last_error)
-                return {
-                    "success": False,
-                    "attempts": attempt,
-                    "message": f"브라우저 라이브러리 없음. drafts/ 저장됨. {last_error}",
-                }
-
             except Exception as e:
                 last_error = str(e)
                 logger.error(f"[DeployAgent] 시도 {attempt} 예외: {e}")

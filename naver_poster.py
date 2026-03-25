@@ -369,12 +369,126 @@ async def _publish(page):
 
 
 # ─────────────────────────────────────────
+# HTTP API 폴백 (브라우저 없이 requests 사용)
+# ─────────────────────────────────────────
+
+def _cookies_to_requests(playwright_cookies):
+    """Playwright 쿠키 리스트 → requests CookieJar 호환 dict"""
+    return {c["name"]: c["value"] for c in playwright_cookies if "name" in c and "value" in c}
+
+
+def post_via_http(title, content_html, tags, category, blog_config) -> bool:
+    """
+    브라우저 없이 requests로 Naver Blog AJAX API 직접 호출.
+    저장된 쿠키가 유효해야 동작 (만료 시 False 반환).
+    """
+    import requests as req
+
+    cookie_data = load_cookies(blog_config["cookie_file"])
+    if not cookie_data:
+        logger.error("[HTTP] 저장된 쿠키 없음 — first_login.py 실행 필요")
+        return False
+
+    blog_id  = blog_config["blog_id"]
+    naver_id = blog_config["naver_id"]
+
+    session = req.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer": f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://blog.naver.com",
+    })
+    session.cookies.update(_cookies_to_requests(cookie_data))
+
+    # 로그인 상태 확인
+    try:
+        check = session.get("https://www.naver.com", timeout=10)
+        if naver_id.lower() not in check.text.lower() and "로그아웃" not in check.text:
+            logger.error("[HTTP] 쿠키 만료 — first_login.py 로 재로그인 필요")
+            return False
+    except Exception as e:
+        logger.error(f"[HTTP] 로그인 확인 실패: {e}")
+        return False
+
+    # 글쓰기 폼 GET → 숨겨진 토큰 추출
+    try:
+        form_resp = session.get(
+            f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}",
+            timeout=15,
+        )
+    except Exception as e:
+        logger.error(f"[HTTP] 글쓰기 폼 로드 실패: {e}")
+        return False
+
+    # CSRF / blogNo 파싱 시도
+    blog_no = ""
+    import re
+    m = re.search(r'"blogNo"\s*:\s*"?(\d+)"?', form_resp.text)
+    if m:
+        blog_no = m.group(1)
+
+    # 포스팅 AJAX 요청
+    post_data = {
+        "blogId":              blog_id,
+        "blogNo":              blog_no,
+        "logNo":               "0",
+        "title":               title,
+        "contents":            content_html,
+        "categoryNo":          "0",
+        "tag":                 tags,
+        "type":                "post",
+        "status":              "publish",
+        "useRssYN":            "Y",
+        "allowComment":        "true",
+        "allowLike":           "true",
+        "allowExternalSearch": "true",
+        "addCategoryYN":       "N",
+        "addContents":         "",
+        "publishDate":         "",
+        "publishTime":         "",
+        "cclUploadLicense":    "",
+        "cclCommercial":       "",
+        "cclModification":     "",
+    }
+
+    try:
+        resp = session.post(
+            "https://blog.naver.com/PostSaveAjax.naver",
+            data=post_data,
+            timeout=30,
+        )
+        logger.info(f"[HTTP] 응답 {resp.status_code}: {resp.text[:300]}")
+        try:
+            j = resp.json()
+            if j.get("result") == "SUCCESS" or j.get("logNo") or j.get("postNo"):
+                logger.info(f"[HTTP] ✅ 포스팅 성공: {j}")
+                return True
+            logger.error(f"[HTTP] API 오류 응답: {j}")
+        except Exception:
+            # JSON이 아닌 경우 200이면 성공으로 간주
+            if resp.status_code == 200 and "error" not in resp.text.lower():
+                logger.info("[HTTP] ✅ 포스팅 성공 (비JSON 200 응답)")
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"[HTTP] POST 실패: {e}")
+        return False
+
+
+# ─────────────────────────────────────────
 # 동기 래퍼 & 로컬 저장
 # ─────────────────────────────────────────
 
 def post_blog(title, content_html, tags, category, blog_config):
-    """동기 함수 래퍼"""
-    return asyncio.run(post_to_naver_blog(title, content_html, tags, category, blog_config))
+    """브라우저 시도 → HTTP API 폴백 → False"""
+    # 브라우저 시도
+    try:
+        return asyncio.run(post_to_naver_blog(title, content_html, tags, category, blog_config))
+    except BrowserUnavailableError:
+        logger.warning("[post_blog] 브라우저 불가 → HTTP API 폴백")
+        return post_via_http(title, content_html, tags, category, blog_config)
 
 
 def save_post_locally(title, content_html, tags, category, blog_config, filename=None):
