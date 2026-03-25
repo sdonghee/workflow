@@ -11,7 +11,7 @@ from typing import List, Dict, Tuple, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.base_agent import BaseAgent, LLAMA_70B, HERMES_405B
+from agents.base_agent import BaseAgent, LLAMA_70B, QWEN_72B, QWEN_235B, HERMES_405B, DEEPSEEK_V3, GEMMA_27B, MISTRAL_24B
 from content_fetcher import collect_all_content, fetch_web_content
 from config import CATEGORIES
 
@@ -22,9 +22,10 @@ class ResearchAgent(BaseAgent):
     """트렌딩 기사 수집 및 주제 분석 에이전트"""
 
     def __init__(self):
+        # 검색·분석 특화 → 추론 강한 모델 우선
         super().__init__(
             model=LLAMA_70B,
-            fallback_models=[HERMES_405B],
+            fallback_models=[QWEN_72B, QWEN_235B, DEEPSEEK_V3, HERMES_405B, GEMMA_27B, MISTRAL_24B],
         )
 
     def get_articles(self, category: str, max_count: int = 5) -> List[dict]:

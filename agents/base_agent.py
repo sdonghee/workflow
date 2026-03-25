@@ -1,6 +1,9 @@
 """
 에이전트 기반 클래스
-OpenRouter API 클라이언트 + 자동 폴백 로직 공통 제공
+OpenRouter 무료 모델 풀 + 순서 지정 폴백 로직 공통 제공
+
+폴백 순서:
+  메인 모델 → 지정 폴백 목록 → FREE_POOL 나머지 (순서 고정)
 """
 import json
 import logging
@@ -16,17 +19,39 @@ from config import OPENROUTER_API_KEY
 
 logger = logging.getLogger(__name__)
 
-# ─── OpenRouter 무료 모델 ID ────────────────────────────────────
-HERMES_405B = "nousresearch/hermes-3-llama-3.1-405b:free"
-LLAMA_70B   = "meta-llama/llama-3.3-70b-instruct:free"
-GEMMA_27B   = "google/gemma-3-27b-it:free"
+# ─── OpenRouter 무료 모델 (품질·속도 순 정렬) ───────────────────
+HERMES_405B  = "nousresearch/hermes-3-llama-3.1-405b:free"
+DEEPSEEK_R1  = "deepseek/deepseek-r1:free"
+DEEPSEEK_V3  = "deepseek/deepseek-chat-v3-0324:free"
+QWEN_235B    = "qwen/qwen3-235b-a22b:free"
+QWEN_72B     = "qwen/qwen3-72b:free"
+LLAMA_70B    = "meta-llama/llama-3.3-70b-instruct:free"
+GEMMA_27B    = "google/gemma-3-27b-it:free"
+MISTRAL_24B  = "mistralai/mistral-small-3.1-24b-instruct:free"
+GEMMA_12B    = "google/gemma-3-12b-it:free"
+PHI4         = "microsoft/phi-4:free"
+
+# 전체 풀 (우선순위 고정 순서)
+FREE_POOL = [
+    HERMES_405B,
+    DEEPSEEK_R1,
+    DEEPSEEK_V3,
+    QWEN_235B,
+    QWEN_72B,
+    LLAMA_70B,
+    GEMMA_27B,
+    MISTRAL_24B,
+    GEMMA_12B,
+    PHI4,
+]
 
 
 class BaseAgent:
-    """OpenRouter 기반 에이전트 공통 기반 클래스"""
+    """OpenRouter 무료 모델 풀 기반 에이전트 공통 기반 클래스"""
 
     PRIMARY_MODEL   = HERMES_405B
-    FALLBACK_MODELS = [LLAMA_70B, GEMMA_27B]
+    FALLBACK_MODELS = [DEEPSEEK_R1, DEEPSEEK_V3, QWEN_235B, QWEN_72B,
+                       LLAMA_70B, GEMMA_27B, MISTRAL_24B, GEMMA_12B, PHI4]
 
     def __init__(self, model: str = None, fallback_models: list = None):
         self.client = OpenAI(
@@ -34,7 +59,19 @@ class BaseAgent:
             api_key=OPENROUTER_API_KEY,
         )
         self.primary_model   = model or self.PRIMARY_MODEL
-        self.fallback_models = fallback_models or self.FALLBACK_MODELS
+        self.fallback_models = fallback_models if fallback_models is not None else self.FALLBACK_MODELS
+
+    def _build_model_queue(self) -> List[str]:
+        """
+        시도 순서: 메인 → 지정 폴백 → FREE_POOL 나머지 (순서 고정, 중복 제거).
+        """
+        queue = [self.primary_model] + self.fallback_models
+        seen  = set(queue)
+        for m in FREE_POOL:
+            if m not in seen:
+                queue.append(m)
+                seen.add(m)
+        return queue
 
     # ── 핵심 메서드: 모델 폴백 포함 텍스트 응답 ──────────────────
     def chat(
@@ -44,12 +81,10 @@ class BaseAgent:
         temperature: float = 0.7,
     ) -> Optional[str]:
         """
-        요청 전송. 실패 시 fallback_models 순서대로 재시도.
+        요청 전송. 실패 시 폴백 목록 → FREE_POOL 순으로 재시도.
         Returns: 응답 텍스트 또는 None
         """
-        models = [self.primary_model] + self.fallback_models
-
-        for model in models:
+        for model in self._build_model_queue():
             try:
                 resp = self.client.chat.completions.create(
                     model=model,
@@ -59,12 +94,12 @@ class BaseAgent:
                 )
                 text = resp.choices[0].message.content
                 if text and text.strip():
-                    logger.debug(f"[{self.__class__.__name__}] 응답 성공 ({model})")
+                    logger.info(f"[{self.__class__.__name__}] 응답 성공 ({model})")
                     return text.strip()
             except Exception as e:
                 logger.warning(f"[{self.__class__.__name__}] {model} 실패: {e}")
 
-        logger.error(f"[{self.__class__.__name__}] 모든 모델({models}) 실패")
+        logger.error(f"[{self.__class__.__name__}] FREE_POOL 전체 실패")
         return None
 
     # ── JSON 응답 편의 메서드 ─────────────────────────────────────
@@ -81,7 +116,6 @@ class BaseAgent:
         if fence:
             text = fence.group(1)
         else:
-            # 첫 번째 JSON 객체/배열 추출
             raw = re.search(r"([\[{].*[\]}])", text, re.DOTALL)
             if raw:
                 text = raw.group(1)
