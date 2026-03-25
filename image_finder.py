@@ -5,7 +5,7 @@ Unsplash, Pexels에서 무료 저작권 없는 이미지를 검색합니다.
 import requests
 import logging
 import random
-from config import UNSPLASH_ACCESS_KEY, PEXELS_API_KEY, CATEGORIES
+from config import UNSPLASH_ACCESS_KEY, PEXELS_API_KEY, PIXABAY_API_KEY, CATEGORIES
 
 logger = logging.getLogger(__name__)
 
@@ -84,15 +84,41 @@ def search_pexels(query, per_page=10):
         return []
 
 
-def get_pixabay_image(query):
-    """Pixabay에서 이미지 검색 (API 키 불필요한 공개 엔드포인트)"""
+def search_pixabay(query: str, per_page: int = 10) -> list:
+    """Pixabay에서 이미지 검색 (PIXABAY_API_KEY 필요)"""
+    if not PIXABAY_API_KEY or PIXABAY_API_KEY == "your_pixabay_api_key":
+        return []
     try:
-        # Pixabay 공개 RSS/이미지 검색
-        url = f"https://pixabay.com/api/?key=&q={requests.utils.quote(query)}&image_type=photo&orientation=horizontal&per_page=10&safesearch=true"
-        # API 키가 필요하므로 스킵
+        url = "https://pixabay.com/api/"
+        params = {
+            "key":         PIXABAY_API_KEY,
+            "q":           query,
+            "image_type":  "photo",
+            "orientation": "horizontal",
+            "per_page":    per_page,
+            "safesearch":  "true",
+            "lang":        "ko",
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        images = []
+        for hit in data.get("hits", []):
+            images.append({
+                "url":         hit.get("largeImageURL", hit.get("webformatURL", "")),
+                "thumb":       hit.get("previewURL", ""),
+                "alt":         query,
+                "photographer": hit.get("user", "Pixabay"),
+                "source":      "Pixabay",
+            })
+        logger.info(f"Pixabay에서 {len(images)}개 이미지 검색: {query}")
+        return images
+    except Exception as e:
+        logger.error(f"Pixabay 검색 실패: {e}")
         return []
-    except Exception:
-        return []
+
+
+# 하위 호환 별칭
+get_pixabay_image = search_pixabay
 
 
 def get_free_image_url(category, keywords=None):

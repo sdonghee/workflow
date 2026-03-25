@@ -1,0 +1,118 @@
+"""
+에이전트 4 - 이미지 에이전트
+포스트 주제에 맞는 이미지 수집 또는 AI 생성
+우선순위: Unsplash → Pexels → Pixabay → Pollinations.ai (AI 생성, 무료·키 없음)
+모델: google/gemma-3-27b-it:free (프롬프트 생성용)
+"""
+import logging
+import random
+import urllib.parse
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from agents.base_agent import BaseAgent, GEMMA_27B, LLAMA_70B
+from image_finder import search_unsplash, search_pexels, search_pixabay
+
+logger = logging.getLogger(__name__)
+
+
+class ImageAgent(BaseAgent):
+    """이미지 수집 및 AI 생성 에이전트"""
+
+    def __init__(self):
+        super().__init__(
+            model=GEMMA_27B,
+            fallback_models=[LLAMA_70B],
+        )
+
+    def get_image(self, topic: str, category: str) -> tuple[str, str, str]:
+        """
+        주제에 맞는 이미지 URL, alt 텍스트, 크레딧 반환.
+        Unsplash → Pexels → Pixabay → Pollinations.ai 순서로 시도.
+        """
+        # AI로 최적 영어 검색 키워드 생성
+        query = self._get_search_query(topic, category)
+        logger.info(f"[ImageAgent] 이미지 검색 쿼리: '{query}'")
+
+        # 1순위: Unsplash
+        imgs = search_unsplash(query)
+        if imgs:
+            img = random.choice(imgs[:5])
+            return img["url"], img.get("alt", query), f"📸 Photo by {img['photographer']} on Unsplash"
+
+        # 2순위: Pexels
+        imgs = search_pexels(query)
+        if imgs:
+            img = random.choice(imgs[:5])
+            return img["url"], img.get("alt", query), f"📸 Photo by {img['photographer']} on Pexels"
+
+        # 3순위: Pixabay
+        imgs = search_pixabay(query)
+        if imgs:
+            img = random.choice(imgs[:5])
+            return img["url"], img.get("alt", query), "📸 Image from Pixabay"
+
+        # 4순위: Pollinations.ai (AI 이미지 생성, 완전 무료·키 없음)
+        logger.info("[ImageAgent] 무료 이미지 없음 → Pollinations.ai로 AI 이미지 생성")
+        return self._generate_with_pollinations(topic, category)
+
+    def _get_search_query(self, topic: str, category: str) -> str:
+        """AI로 이미지 검색에 최적화된 영어 키워드 생성"""
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    f"'{topic}' ({category}) 블로그 포스트 대표 이미지 검색에 쓸 "
+                    "영어 키워드를 2~3단어로만 반환하세요. 설명 없이."
+                ),
+            }
+        ]
+        result = self.chat(messages, max_tokens=30, temperature=0.3)
+        if result:
+            # 첫 줄만, 30자 이내
+            return result.split("\n")[0].strip()[:40]
+        # 폴백: 카테고리 기본 키워드
+        fallback = {
+            "여행_항공_호텔": "travel destination",
+            "정부혜택":       "community welfare",
+            "건강":          "healthy lifestyle",
+        }
+        return fallback.get(category, "korea lifestyle")
+
+    def _generate_with_pollinations(
+        self, topic: str, category: str
+    ) -> tuple[str, str, str]:
+        """
+        Pollinations.ai로 AI 이미지 생성.
+        URL 형식: https://image.pollinations.ai/prompt/{encoded}?width=1200&height=630&nologo=true
+        """
+        # AI로 이미지 생성 프롬프트 작성
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    f"'{topic}' 주제 블로그 썸네일 이미지를 위한 "
+                    "Stable Diffusion 영어 프롬프트를 1줄(50단어 이하)로 작성하세요. "
+                    "스타일: professional photography, bright, clean, editorial quality. "
+                    "프롬프트만, 설명 없이."
+                ),
+            }
+        ]
+        prompt_text = self.chat(messages, max_tokens=80, temperature=0.5)
+        if not prompt_text:
+            prompt_text = f"{topic} professional photography blog thumbnail, bright colors"
+
+        # 첫 줄만 사용
+        prompt_text = prompt_text.split("\n")[0].strip()
+
+        seed    = random.randint(1, 99999)
+        encoded = urllib.parse.quote(prompt_text)
+        url = (
+            f"https://image.pollinations.ai/prompt/{encoded}"
+            f"?width=1200&height=630&nologo=true&seed={seed}"
+        )
+
+        logger.info(f"[ImageAgent] Pollinations.ai 이미지 생성: {url[:80]}...")
+        return url, topic, "🎨 AI Generated (Pollinations.ai)"

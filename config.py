@@ -6,17 +6,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# API 키
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+# ── AI / 오케스트레이터 ──────────────────────────────────────────
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")   # Claude API (오케스트레이터)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")  # OpenRouter (에이전트들)
 
-# 포스팅 설정
-POSTS_PER_DAY = int(os.getenv("POSTS_PER_DAY", "7"))
-POST_START_HOUR = int(os.getenv("POST_START_HOUR", "9"))
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+# ── 이미지 API ───────────────────────────────────────────────────
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+PEXELS_API_KEY      = os.getenv("PEXELS_API_KEY", "")
+PIXABAY_API_KEY     = os.getenv("PIXABAY_API_KEY", "")    # Agent 4 이미지 3순위
+
+# ── 검색 API ─────────────────────────────────────────────────────
+GOOGLE_SEARCH_API_KEY    = os.getenv("GOOGLE_SEARCH_API_KEY", "")
+GOOGLE_SEARCH_ENGINE_ID  = os.getenv("GOOGLE_SEARCH_ENGINE_ID", "")
+
+# ── 알림 (Gmail SMTP) ────────────────────────────────────────────
+GMAIL_ADDRESS      = os.getenv("GMAIL_ADDRESS", "")       # Agent 5 실패 알림
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")  # Gmail 앱 비밀번호
+
+# ── 포스팅 타이밍 ────────────────────────────────────────────────
+POSTS_PER_DAY      = int(os.getenv("POSTS_PER_DAY", "7"))
+POST_START_HOUR    = int(os.getenv("POST_START_HOUR", "6"))   # 1회차 06:00
+POST_START_HOUR_2  = int(os.getenv("POST_START_HOUR_2", "12"))  # 2회차 12:00
+POST_INTERVAL_MIN  = int(os.getenv("POST_INTERVAL_MIN", "120"))  # 포스트간 최소 대기(분)
+POST_INTERVAL_MAX  = int(os.getenv("POST_INTERVAL_MAX", "240"))  # 포스트간 최대 대기(분)
+HEADLESS           = os.getenv("HEADLESS", "true").lower() == "true"
+LOG_LEVEL          = os.getenv("LOG_LEVEL", "INFO")
 
 # ─────────────────────────────────────────
 # 멀티 블로그 설정
@@ -119,9 +133,9 @@ CATEGORIES = {
     },
 }
 
-# 게시 간격 (분)
-POSTING_INTERVAL_MINUTES = (8 * 60) // POSTS_PER_DAY
+# 레거시 호환 (daily_poster.py 잔존 코드용)
+POSTING_INTERVAL_MINUTES = POST_INTERVAL_MIN
 
 # 로그 파일 경로
-LOG_FILE = "naver_blog_auto.log"
+LOG_FILE        = "naver_blog_auto.log"
 POSTED_LOG_FILE = "posted_articles.json"

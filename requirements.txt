@@ -1,9 +1,9 @@
-anthropic>=0.40.0
-openai>=1.0.0
-playwright>=1.40.0
+anthropic>=0.40.0        # 오케스트레이터 (Claude API)
+openai>=1.0.0            # OpenRouter 에이전트 공통 클라이언트
+playwright>=1.40.0       # 네이버 블로그 브라우저 자동화
 requests>=2.31.0
 beautifulsoup4>=4.12.0
-# feedparser>=6.0.10  # 별도 설치: pip install feedparser
+feedparser>=6.0.10       # RSS 피드 파싱
 python-dotenv>=1.0.0
 schedule>=1.2.0
 Pillow>=10.0.0
