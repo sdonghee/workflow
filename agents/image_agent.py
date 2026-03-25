@@ -13,7 +13,7 @@ from typing import Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.base_agent import BaseAgent, GEMMA_27B, GEMMA_12B, MISTRAL_24B, PHI4, LLAMA_70B, QWEN_72B
+from agents.base_agent import BaseAgent, GEMMA_12B, GEMMA_27B, NEMOTRON_12B, NEMOTRON_9B, MISTRAL_24B, GPT_OSS_20B, STEPFUN, LLAMA_70B
 from image_finder import search_unsplash, search_pexels, search_pixabay
 
 logger = logging.getLogger(__name__)
@@ -25,8 +25,8 @@ class ImageAgent(BaseAgent):
     def __init__(self):
         # 이미지 프롬프트 생성 → 경량 모델로도 충분
         super().__init__(
-            model=GEMMA_27B,
-            fallback_models=[GEMMA_12B, MISTRAL_24B, PHI4, LLAMA_70B, QWEN_72B],
+            model=GEMMA_12B,
+            fallback_models=[GEMMA_27B, NEMOTRON_12B, NEMOTRON_9B, MISTRAL_24B, GPT_OSS_20B, STEPFUN, LLAMA_70B],
         )
 
     def get_image(self, topic: str, category: str) -> Tuple[str, str, str]:

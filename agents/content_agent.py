@@ -11,7 +11,7 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.base_agent import BaseAgent, HERMES_405B, DEEPSEEK_R1, DEEPSEEK_V3, QWEN_235B, QWEN_72B, LLAMA_70B, GEMMA_27B, MISTRAL_24B
+from agents.base_agent import BaseAgent, HERMES_405B, NEMOTRON_120B, GPT_OSS_120B, QWEN3_80B, LLAMA_70B, MINIMAX, MISTRAL_24B, GEMMA_27B, DOLPHIN_24B
 from config import CATEGORIES
 from content_writer import CATEGORY_SEO
 
@@ -25,7 +25,7 @@ class ContentAgent(BaseAgent):
         # 콘텐츠 품질 최우선 → 대형 모델 우선
         super().__init__(
             model=HERMES_405B,
-            fallback_models=[DEEPSEEK_R1, DEEPSEEK_V3, QWEN_235B, QWEN_72B, LLAMA_70B, GEMMA_27B, MISTRAL_24B],
+            fallback_models=[NEMOTRON_120B, GPT_OSS_120B, QWEN3_80B, LLAMA_70B, MINIMAX, MISTRAL_24B, GEMMA_27B, DOLPHIN_24B],
         )
 
     def generate(self, article: dict, category: str) -> Optional[dict]:

@@ -11,7 +11,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.base_agent import BaseAgent, GEMMA_27B, MISTRAL_24B, GEMMA_12B, LLAMA_70B, PHI4, QWEN_72B, HERMES_405B
+from agents.base_agent import BaseAgent, GEMMA_27B, MISTRAL_24B, DOLPHIN_24B, NEMOTRON_30B, GEMMA_12B, NEMOTRON_12B, LLAMA_70B, GPT_OSS_20B, HERMES_405B
 from content_writer import NAVER_HTML_GUIDE
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ class StructureAgent(BaseAgent):
         # HTML 포맷팅 특화 → 지시 이행 강한 모델 우선
         super().__init__(
             model=GEMMA_27B,
-            fallback_models=[MISTRAL_24B, GEMMA_12B, PHI4, LLAMA_70B, QWEN_72B, HERMES_405B],
+            fallback_models=[MISTRAL_24B, DOLPHIN_24B, NEMOTRON_30B, GEMMA_12B, NEMOTRON_12B, LLAMA_70B, GPT_OSS_20B, HERMES_405B],
         )
 
     def format_html(
