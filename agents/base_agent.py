@@ -12,8 +12,9 @@ from typing import Optional, Union, List, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import anthropic
 from openai import OpenAI
-from config import OPENROUTER_API_KEY
+from config import OPENROUTER_API_KEY, ANTHROPIC_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,29 @@ class BaseAgent:
                     logger.warning(f"[{self.__class__.__name__}] 모델 없음 — 건너뜀: {model}")
                 else:
                     logger.warning(f"[{self.__class__.__name__}] {model} 실패: {err[:80]}")
+
+        # ── 최종 폴백: Claude API (OpenRouter 전체 실패 시) ──────────
+        if ANTHROPIC_API_KEY:
+            logger.warning(f"[{self.__class__.__name__}] OpenRouter 전체 실패 → Claude API 폴백 사용")
+            try:
+                claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                # system 메시지와 user 메시지 분리
+                system_msg = next(
+                    (m["content"] for m in messages if m["role"] == "system"), ""
+                )
+                user_messages = [m for m in messages if m["role"] != "system"]
+                resp = claude_client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=min(max_tokens, 8000),
+                    system=system_msg if system_msg else anthropic.NOT_GIVEN,
+                    messages=user_messages,
+                )
+                text = resp.content[0].text
+                if text and text.strip():
+                    logger.info(f"[{self.__class__.__name__}] Claude 폴백 성공")
+                    return text.strip()
+            except Exception as e:
+                logger.error(f"[{self.__class__.__name__}] Claude 폴백도 실패: {e}")
 
         logger.error(f"[{self.__class__.__name__}] 모든 모델 실패")
         return None
