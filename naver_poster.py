@@ -211,17 +211,30 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 
             logger.info(f"[{blog_config['name']}] 글쓰기 페이지: {page.url}")
 
-            # mainFrame 로드 대기
+            # mainFrame 로드 대기 (iframe이 async로 삽입되므로 DOM에 나타날 때까지 대기)
+            try:
+                await page.wait_for_selector(
+                    "iframe[name='mainFrame'], iframe#mainFrame",
+                    timeout=15000
+                )
+                await page.wait_for_timeout(2000)
+            except Exception:
+                logger.warning("mainFrame iframe DOM 미발견, 계속 진행")
+
+            # 모든 frame 목록 로그 (디버깅)
+            frame_info = [(f.name or "noname", f.url[:60]) for f in page.frames]
+            logger.info(f"로드된 frames({len(frame_info)}개): {frame_info}")
+
             main_frame = page.frame(name="mainFrame")
             if main_frame:
                 try:
                     await main_frame.wait_for_load_state("domcontentloaded", timeout=10000)
-                    await page.wait_for_timeout(2000)
-                    logger.info("mainFrame 로드 완료")
+                    await page.wait_for_timeout(1000)
+                    logger.info(f"mainFrame 로드 완료: {main_frame.url[:60]}")
                 except Exception:
                     logger.warning("mainFrame 로드 대기 실패, 계속 진행")
             else:
-                logger.warning("mainFrame 없음, 계속 진행")
+                logger.warning("mainFrame frame 객체 없음, 계속 진행")
 
             # 4. 제목 입력
             await _enter_title(page, title)
@@ -375,19 +388,49 @@ async def _enter_tags(page, tags):
     logger.warning("태그 입력 실패 (계속 진행)")
 
 
-async def _publish(page):
-    """발행 버튼 클릭 - SmartEditor ONE"""
-    publish_selectors = [
-        "button.se-btn-publish",
-        "button[class*='publish']",
-        "button:has-text('발행')",
-        ".btn_publish",
-        ".se_publish",
-        "a:has-text('발행')",
-        "button:has-text('게시')",
-        "#publish-btn",
-    ]
+_PUBLISH_JS = """
+(function() {
+    var keywords = ['발행', '게시', 'publish'];
+    var cssClasses = ['publish', 'btn_publish', 'se_publish'];
 
+    // CSS class 기반 탐색
+    for (var cls of cssClasses) {
+        var el = document.querySelector('button.' + cls + ', a.' + cls + ', .' + cls);
+        if (el) { el.click(); return 'css:' + cls; }
+    }
+    // 텍스트 기반 탐색 (has-text 대신 JS로)
+    var all = Array.from(document.querySelectorAll('button, a[href], input[type="button"]'));
+    for (var kw of keywords) {
+        var btn = all.find(function(b) {
+            return b.textContent.trim() === kw ||
+                   (b.value && b.value.trim() === kw);
+        });
+        if (btn) { btn.click(); return 'text:' + kw; }
+    }
+    return false;
+})()
+"""
+
+_CONFIRM_JS = """
+(function() {
+    var keywords = ['공개발행', '전체공개', '확인', '발행하기'];
+    var all = Array.from(document.querySelectorAll('button, a'));
+    for (var kw of keywords) {
+        var btn = all.find(function(b) { return b.textContent.trim().includes(kw); });
+        if (btn) { btn.click(); return 'confirm:' + kw; }
+    }
+    // .btn_confirm, .btn_ok
+    for (var cls of ['.btn_confirm', '.btn_ok', '.btn-primary']) {
+        var el = document.querySelector(cls);
+        if (el) { el.click(); return 'css-confirm:' + cls; }
+    }
+    return false;
+})()
+"""
+
+
+async def _publish(page):
+    """발행 버튼 클릭 - SmartEditor ONE (JS 기반, has-text 제거로 timeout 방지)"""
     main_frame = page.frame(name="mainFrame")
     search_frames = []
     if main_frame:
@@ -397,58 +440,58 @@ async def _publish(page):
         if f not in search_frames:
             search_frames.append(f)
 
-    # 1단계: 발행 버튼 (메인 페이지 → frames 순)
+    # 1단계: 발행 버튼 (메인 페이지 → frames 순, JS 텍스트 탐색)
     clicked = False
-    for sel in publish_selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                await el.click()
-                logger.info(f"발행 버튼 클릭: {sel}")
-                await page.wait_for_timeout(3000)
-                clicked = True
-                break
-        except Exception:
-            continue
+
+    # 메인 페이지 먼저
+    try:
+        result = await page.evaluate(_PUBLISH_JS)
+        if result:
+            logger.info(f"발행 버튼 클릭(main): {result}")
+            await page.wait_for_timeout(3000)
+            clicked = True
+    except Exception:
+        pass
 
     if not clicked:
         for frame in search_frames:
-            for sel in publish_selectors:
-                try:
-                    el = await frame.query_selector(sel)
-                    if el:
-                        await el.click()
-                        logger.info(f"발행 버튼 클릭(frame): {sel}")
-                        await page.wait_for_timeout(3000)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            if clicked:
-                break
+            try:
+                result = await frame.evaluate(_PUBLISH_JS)
+                if result:
+                    logger.info(f"발행 버튼 클릭(frame): {result}")
+                    await page.wait_for_timeout(3000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
 
     if not clicked:
         logger.error("발행 버튼 없음")
         return False
 
-    # 2단계: 확인/공개발행 모달
-    confirm_selectors = [
-        "button:has-text('공개발행')",
-        "button:has-text('전체공개')",
-        "button:has-text('확인')",
-        ".btn_confirm",
-        ".btn_ok",
-    ]
-    for sel in confirm_selectors:
+    # 2단계: 확인/공개발행 모달 (JS 텍스트 탐색)
+    for attempt in range(5):
+        await page.wait_for_timeout(1000)
         try:
-            await page.click(sel, timeout=3000)
-            logger.info(f"발행 확인: {sel}")
-            await page.wait_for_timeout(2000)
-            return True
+            result = await page.evaluate(_CONFIRM_JS)
+            if result:
+                logger.info(f"발행 확인: {result}")
+                await page.wait_for_timeout(2000)
+                return True
         except Exception:
-            continue
+            pass
+        # frames에서도 확인 모달 탐색
+        for frame in search_frames:
+            try:
+                result = await frame.evaluate(_CONFIRM_JS)
+                if result:
+                    logger.info(f"발행 확인(frame): {result}")
+                    await page.wait_for_timeout(2000)
+                    return True
+            except Exception:
+                continue
 
-    # 확인 버튼 없어도 발행된 경우
+    # 확인 버튼 없어도 이미 발행된 경우
     await page.wait_for_timeout(2000)
     return True
 
