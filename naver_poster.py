@@ -282,6 +282,34 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
                     logger.info(f"mainFrame 로드 완료: {main_frame.url[:60]}")
                 except Exception:
                     logger.warning("mainFrame 로드 대기 실패, 계속 진행")
+
+                # 잘못된 블로그 리다이렉트 감지 (쿠키에 다른 계정 정보가 있을 때)
+                # 예: flighttravel?Redirect=Write → PostList.naver?blogId=wiselife000
+                mf_url = main_frame.url if main_frame else ""
+                if "PostWriteForm" not in mf_url and "PostWrite" not in mf_url:
+                    logger.warning(f"[{blog_config['name']}] 글쓰기 폼 아닌 페이지 감지: {mf_url[:80]} → ID/PW 재로그인")
+                    logged_in = await login_with_password(page, blog_config)
+                    if not logged_in:
+                        logger.error(f"[{blog_config['name']}] ❌ 재로그인 실패")
+                        return False
+                    cookies = await context.cookies()
+                    save_cookies(cookies, blog_config["cookie_file"])
+                    await page.goto(write_url, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(5000)
+                    if len(context.pages) > 1:
+                        page = context.pages[-1]
+                        await page.wait_for_load_state("domcontentloaded")
+                        await page.wait_for_timeout(3000)
+                    # mainFrame 재취득
+                    main_frame = page.frame(name="mainFrame")
+                    if main_frame:
+                        try:
+                            await main_frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                        except Exception:
+                            pass
+                    logger.info(f"[{blog_config['name']}] 재로그인 후 글쓰기 페이지: {page.url}")
+                    if main_frame:
+                        logger.info(f"재로그인 후 mainFrame: {main_frame.url[:60]}")
             else:
                 logger.warning("mainFrame frame 객체 없음, 계속 진행")
 
