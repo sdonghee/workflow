@@ -520,10 +520,12 @@ async def _publish(page):
         # 메인 페이지에서 먼저
         try:
             result = await page.evaluate(_CONFIRM_JS)
-            if result:
+            if result and not str(result).startswith('not_found'):
                 logger.info(f"발행 확인: {result}")
                 await page.wait_for_timeout(3000)
                 return True
+            elif result:
+                logger.info(f"발행 확인 탐색중(main): {result}")
         except Exception:
             pass
 
@@ -531,10 +533,12 @@ async def _publish(page):
         for frame in search_frames:
             try:
                 result = await frame.evaluate(_CONFIRM_JS)
-                if result:
+                if result and not str(result).startswith('not_found'):
                     logger.info(f"발행 확인(frame/{frame.name or 'noname'}): {result}")
                     await page.wait_for_timeout(3000)
                     return True
+                elif result:
+                    logger.info(f"발행 확인 탐색중({frame.name or 'noname'}): {result}")
             except Exception:
                 continue
 
