@@ -356,33 +356,19 @@ async def _enter_content(page, content_html):
         try:
             result = await frame.evaluate(f"""
                 (function() {{
-                    // 1) body 자체가 contenteditable (input_buffer 프레임)
+                    // input_buffer 프레임: body 자체가 contenteditable
                     if (document.body && document.body.contentEditable === 'true') {{
-                        document.body.innerHTML = `{safe_html}`;
-                        document.body.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        document.body.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
-                        return 'body-editable';
-                    }}
-                    // 2) .se-content 내 editable 영역
-                    var seContent = document.querySelector('.se-content');
-                    if (seContent) {{
-                        var editable = seContent.querySelector('[contenteditable="true"]');
-                        if (editable) {{
-                            editable.innerHTML = `{safe_html}`;
-                            editable.dispatchEvent(new Event('input', {{bubbles: true}}));
-                            return 'se-content';
+                        document.body.focus();
+                        // execCommand('selectAll') + insertHTML → SmartEditor 내부 상태 갱신
+                        document.execCommand('selectAll', false, null);
+                        var ok = document.execCommand('insertHTML', false, `{safe_html}`);
+                        if (!ok) {{
+                            // fallback: innerHTML 직접
+                            document.body.innerHTML = `{safe_html}`;
                         }}
-                    }}
-                    // 3) 제목 제외 마지막 contenteditable
-                    var all = Array.from(document.querySelectorAll('[contenteditable="true"]'));
-                    var nonTitle = all.filter(function(el) {{
-                        return !el.className.includes('title') && el.tagName !== 'INPUT';
-                    }});
-                    if (nonTitle.length > 0) {{
-                        var target = nonTitle[nonTitle.length - 1];
-                        target.innerHTML = `{safe_html}`;
-                        target.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        return 'last-editable';
+                        document.body.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
+                        document.body.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return 'body-execCommand';
                     }}
                     return false;
                 }})()
@@ -444,25 +430,45 @@ _PUBLISH_JS = """
 
 _CONFIRM_JS = """
 (function() {
-    // Naver 발행 확인 패널: '공개발행', '전체공개', '발행하기', '확인' 버튼 탐색
-    var keywords = ['공개발행', '발행하기', '전체공개', '확인'];
-    var all = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
-    for (var kw of keywords) {
-        var btn = all.find(function(b) {
-            var t = (b.textContent || b.value || '').trim();
-            return t === kw || t.includes(kw);
-        });
-        if (btn && btn.offsetParent !== null) {
-            // offsetParent !== null 이면 실제로 보이는 요소
-            btn.click();
-            return 'confirm:' + kw;
+    // SmartEditor ONE 발행 확인: '확인' 제외, 발행 패널의 실제 '발행' 버튼 탐색
+
+    // 1. 발행 패널/레이어 컨테이너 내부 탐색
+    var panelSelectors = [
+        '.se-post-publish', '.se-publish-panel', '.se-publish-setting',
+        '[class*="publish"][class*="panel"]', '[class*="publish"][class*="layer"]',
+        '[class*="publish"][class*="wrap"]', '[class*="publish"][class*="area"]',
+    ];
+    for (var pSel of panelSelectors) {
+        var panel = document.querySelector(pSel);
+        if (panel && panel.offsetParent !== null) {
+            var btns = Array.from(panel.querySelectorAll('button, a'));
+            var pub = btns.find(function(b) {
+                var t = (b.textContent || '').trim();
+                return t === '발행' || t.includes('공개발행') || t.includes('발행하기');
+            });
+            if (pub) { pub.click(); return 'panel:' + pub.textContent.trim(); }
         }
     }
-    // CSS class 기반
-    for (var cls of ['.btn_confirm', '.btn_ok', '.btn-primary', '.publish_btn']) {
-        var el = document.querySelector(cls);
-        if (el && el.offsetParent !== null) { el.click(); return 'css-confirm:' + cls; }
+
+    // 2. '공개발행', '발행하기', '전체공개' 키워드 (가시 요소만)
+    var keywords = ['공개발행', '발행하기', '전체공개'];
+    var all = Array.from(document.querySelectorAll('button, a'));
+    for (var kw of keywords) {
+        var btn = all.find(function(b) {
+            return b.textContent.trim().includes(kw) && b.offsetParent !== null;
+        });
+        if (btn) { btn.click(); return 'kw:' + kw; }
     }
+
+    // 3. 가시적 '발행' 버튼 중 마지막 것 (패널에서 새로 생긴 버튼)
+    var publishBtns = all.filter(function(b) {
+        return b.textContent.trim() === '발행' && b.offsetParent !== null;
+    });
+    if (publishBtns.length >= 1) {
+        publishBtns[publishBtns.length - 1].click();
+        return 'publish-last(' + publishBtns.length + ')';
+    }
+
     return false;
 })()
 """
