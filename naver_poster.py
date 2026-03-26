@@ -325,7 +325,10 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 # ─────────────────────────────────────────
 
 async def _enter_title(page, title):
-    """제목 입력 - SmartEditor ONE"""
+    """제목 입력 - SmartEditor ONE
+    핵심: Playwright의 실제 click()으로 포커스를 준 뒤 keyboard.type() 사용.
+    execCommand만으로는 React 내부 상태가 갱신되지 않아 발행 시 제목이 비어버림.
+    """
     main_frame = page.frame(name="mainFrame")
     if not main_frame:
         logger.warning("제목 입력 실패: mainFrame 없음")
@@ -333,100 +336,104 @@ async def _enter_title(page, title):
 
     await page.wait_for_timeout(1000)
 
-    # JS로 mainFrame에서 제목 요소 탐색 (선택자 우선순위 순, 디버그 정보 반환)
-    result = await main_frame.evaluate("""
-        (title) => {
-            var selectors = [
-                '.se-title-input',
-                'div[contenteditable="true"][class*="title"]',
-                'div[contenteditable="true"][aria-multiline="false"]',
-                'div[contenteditable="true"][data-placeholder]',
-            ];
-            var el = null;
-            for (var sel of selectors) {
-                el = document.querySelector(sel);
-                if (el) break;
-            }
-            // Fallback: mainFrame 내 첫 번째 contenteditable (body 제외)
-            if (!el) {
-                var all = Array.from(document.querySelectorAll('[contenteditable="true"]'));
-                el = all.find(function(e) { return e.tagName !== 'BODY'; });
-            }
-            if (!el) {
-                var allInfo = Array.from(document.querySelectorAll('[contenteditable]'));
-                return 'not_found:count=' + allInfo.length + ':' +
-                    allInfo.map(function(e) { return e.tagName + '.' + (e.className || '').substring(0, 40); }).join('|');
-            }
-            el.focus();
-            el.innerHTML = '';
-            document.execCommand('selectAll', false, null);
-            document.execCommand('insertText', false, title);
-            el.dispatchEvent(new Event('input', {bubbles: true}));
-            return 'ok:' + (el.className || el.tagName);
-        }
-    """, title)
+    # 제목 영역 selector 우선순위 (SmartEditor ONE)
+    selectors = [
+        '.se-title-text',
+        '.se-title-input',
+        'div[contenteditable="true"][class*="title"]',
+        'div[contenteditable="true"][aria-multiline="false"]',
+        'div[contenteditable="true"][data-placeholder]',
+    ]
 
-    if result and result.startswith('ok:'):
-        logger.info(f"제목 입력 완료: {title[:30]} ({result})")
-    else:
-        logger.warning(f"제목 입력 실패: {result}")
+    for sel in selectors:
+        try:
+            locator = main_frame.locator(sel).first
+            if await locator.count() == 0:
+                continue
+            # Playwright 실제 클릭 → 포커스
+            await locator.click()
+            await page.wait_for_timeout(400)
+            # 전체 선택 후 타이핑 (keyboard.type은 React 이벤트 정상 트리거)
+            await page.keyboard.press("Control+a")
+            await page.keyboard.type(title, delay=40)
+            await page.wait_for_timeout(300)
+            logger.info(f"제목 입력 완료: {title[:30]} (selector: {sel})")
+            return
+        except Exception as e:
+            logger.debug(f"제목 selector 시도 실패 ({sel}): {e}")
+            continue
+
+    # 최후 폴백: JS로 첫 번째 contenteditable 요소를 직접 찾아 click
+    try:
+        result = await main_frame.evaluate("""
+            () => {
+                var all = Array.from(document.querySelectorAll('[contenteditable="true"]'));
+                var el = all.find(function(e) { return e.tagName !== 'BODY'; });
+                if (!el) {
+                    var debug = Array.from(document.querySelectorAll('[contenteditable]'))
+                        .map(function(e) { return e.tagName + '.' + (e.className||'').substring(0,30); }).join('|');
+                    return 'not_found:' + debug;
+                }
+                // getBoundingClientRect으로 좌표 반환 → Playwright에서 클릭
+                var rect = el.getBoundingClientRect();
+                return JSON.stringify({x: rect.left + rect.width/2, y: rect.top + rect.height/2, cls: el.className.substring(0,40)});
+            }
+        """)
+        if result and not result.startswith('not_found'):
+            import json as _json
+            info = _json.loads(result)
+            await main_frame.mouse.click(info['x'], info['y'])
+            await page.wait_for_timeout(400)
+            await page.keyboard.press("Control+a")
+            await page.keyboard.type(title, delay=40)
+            logger.info(f"제목 입력 완료 (폴백 클릭): {title[:30]} cls={info.get('cls','')}")
+        else:
+            logger.warning(f"제목 입력 실패: {result}")
+    except Exception as e:
+        logger.warning(f"제목 입력 폴백 실패: {e}")
 
 
 async def _enter_content(page, content_html):
-    """본문 입력 - SmartEditor ONE (body[contenteditable] 우선 탐색)"""
+    """본문 입력 - SmartEditor ONE
+    핵심: Playwright의 실제 click()으로 input_buffer body에 포커스를 준 뒤
+    execCommand('insertHTML') 실행. click 없이 JS만으로는 React 상태 미갱신.
+    """
     safe_html = content_html.replace("`", "'").replace("\\", "\\\\").replace("\n", "")
 
-    # input_buffer 프레임 우선 탐색 (SmartEditor ONE의 실제 편집 iframe)
+    # input_buffer 프레임 탐색 (SmartEditor ONE 본문 편집 iframe)
     input_frame = None
     for f in page.frames:
         if f.name.startswith("input_buffer"):
             input_frame = f
             break
 
-    main_frame = page.frame(name="mainFrame")
+    if not input_frame:
+        logger.warning("input_buffer 프레임 없음 — 프레임 목록: " +
+                       str([(f.name or "noname", f.url[:30]) for f in page.frames]))
+        return
 
-    # 탐색 순서: input_buffer → mainFrame child_frames → mainFrame → 나머지
-    search_frames = []
-    if input_frame:
-        search_frames.append(input_frame)
-    if main_frame:
-        for cf in main_frame.child_frames:
-            if cf not in search_frames:
-                search_frames.append(cf)
-        if main_frame not in search_frames:
-            search_frames.append(main_frame)
-    for f in page.frames:
-        if f not in search_frames:
-            search_frames.append(f)
+    try:
+        # Playwright 실제 클릭으로 body 포커스 (OS 레벨 포커스 이벤트 트리거)
+        await input_frame.locator("body").click()
+        await page.wait_for_timeout(400)
 
-    for frame in search_frames:
-        try:
-            result = await frame.evaluate(f"""
-                (function() {{
-                    // input_buffer 프레임: body 자체가 contenteditable
-                    if (document.body && document.body.contentEditable === 'true') {{
-                        document.body.focus();
-                        // execCommand('selectAll') + insertHTML → SmartEditor 내부 상태 갱신
-                        document.execCommand('selectAll', false, null);
-                        var ok = document.execCommand('insertHTML', false, `{safe_html}`);
-                        if (!ok) {{
-                            // fallback: innerHTML 직접
-                            document.body.innerHTML = `{safe_html}`;
-                        }}
-                        document.body.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
-                        document.body.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        return 'body-execCommand';
-                    }}
-                    return false;
-                }})()
+        # 전체 선택 후 HTML 삽입
+        await input_frame.evaluate("document.execCommand('selectAll', false, null)")
+        ok = await input_frame.evaluate(f"document.execCommand('insertHTML', false, `{safe_html}`)")
+
+        if ok:
+            logger.info(f"본문 입력 완료: insertHTML (frame: {input_frame.name})")
+        else:
+            # insertHTML이 false 반환 시 innerHTML 직접 설정
+            await input_frame.evaluate(f"document.body.innerHTML = `{safe_html}`")
+            # 수동으로 input 이벤트 발생
+            await input_frame.evaluate("""
+                document.body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}));
             """)
-            if result:
-                logger.info(f"본문 입력 완료: {result} (frame: {frame.name or frame.url[:40]})")
-                return
-        except Exception:
-            continue
+            logger.info(f"본문 입력 완료: innerHTML 폴백 (frame: {input_frame.name})")
 
-    logger.warning("본문 입력 실패")
+    except Exception as e:
+        logger.error(f"본문 입력 실패: {e}")
 
 
 async def _enter_tags(page, tags):
