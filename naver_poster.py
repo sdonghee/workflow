@@ -186,6 +186,12 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 
         page = await context.new_page()
 
+        # 브라우저 다이얼로그(alert/confirm) 자동 처리 — 제목 없음 경고 등
+        async def _on_dialog(dialog):
+            logger.warning(f"브라우저 다이얼로그: [{dialog.type}] {dialog.message}")
+            await dialog.dismiss()
+        page.on("dialog", _on_dialog)
+
         try:
             # 1. 쿠키로 로그인 시도
             logged_in = await login_with_cookies(context, page, blog_config)
@@ -430,46 +436,34 @@ _PUBLISH_JS = """
 
 _CONFIRM_JS = """
 (function() {
-    // SmartEditor ONE 발행 확인: '확인' 제외, 발행 패널의 실제 '발행' 버튼 탐색
+    // 툴바(.se-toolbar) 내 버튼은 제외 — 첫 번째 '발행' 클릭 시 이미 사용된 버튼
+    var toolbarEls = new Set(
+        Array.from(document.querySelectorAll('.se-toolbar *, ul[class*="toolbar"] *, [class*="document-toolbar"] *'))
+    );
 
-    // 1. 발행 패널/레이어 컨테이너 내부 탐색
-    var panelSelectors = [
-        '.se-post-publish', '.se-publish-panel', '.se-publish-setting',
-        '[class*="publish"][class*="panel"]', '[class*="publish"][class*="layer"]',
-        '[class*="publish"][class*="wrap"]', '[class*="publish"][class*="area"]',
-    ];
-    for (var pSel of panelSelectors) {
-        var panel = document.querySelector(pSel);
-        if (panel && panel.offsetParent !== null) {
-            var btns = Array.from(panel.querySelectorAll('button, a'));
-            var pub = btns.find(function(b) {
-                var t = (b.textContent || '').trim();
-                return t === '발행' || t.includes('공개발행') || t.includes('발행하기');
-            });
-            if (pub) { pub.click(); return 'panel:' + pub.textContent.trim(); }
-        }
-    }
+    var all = Array.from(document.querySelectorAll('button, a[role="button"], a[class*="btn"]'));
+    // 툴바 제외
+    var candidates = all.filter(function(b) { return !toolbarEls.has(b); });
 
-    // 2. '공개발행', '발행하기', '전체공개' 키워드 (가시 요소만)
+    // 1. '공개발행', '발행하기', '전체공개' 우선
     var keywords = ['공개발행', '발행하기', '전체공개'];
-    var all = Array.from(document.querySelectorAll('button, a'));
     for (var kw of keywords) {
-        var btn = all.find(function(b) {
-            return b.textContent.trim().includes(kw) && b.offsetParent !== null;
-        });
-        if (btn) { btn.click(); return 'kw:' + kw; }
+        var btn = candidates.find(function(b) { return b.textContent.trim().includes(kw); });
+        if (btn) { btn.click(); return 'kw:' + kw + ':' + btn.className.substring(0, 30); }
     }
 
-    // 3. 가시적 '발행' 버튼 중 마지막 것 (패널에서 새로 생긴 버튼)
-    var publishBtns = all.filter(function(b) {
-        return b.textContent.trim() === '발행' && b.offsetParent !== null;
-    });
-    if (publishBtns.length >= 1) {
-        publishBtns[publishBtns.length - 1].click();
-        return 'publish-last(' + publishBtns.length + ')';
+    // 2. 툴바 외 '발행' 버튼 (= 패널의 발행 버튼)
+    var publishBtns = candidates.filter(function(b) { return b.textContent.trim() === '발행'; });
+    if (publishBtns.length > 0) {
+        publishBtns[0].click();
+        return 'non-toolbar-publish:' + publishBtns.length + ':' + publishBtns[0].className.substring(0, 40);
     }
 
-    return false;
+    // 3. 디버그: 후보 버튼 목록 반환
+    var debugInfo = candidates.slice(0, 10).map(function(b) {
+        return (b.textContent.trim() || b.className).substring(0, 20);
+    }).join('|');
+    return 'not_found:candidates=' + candidates.length + ':' + debugInfo;
 })()
 """
 
