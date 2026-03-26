@@ -423,49 +423,65 @@ async def _enter_title(page, title):
 
 async def _enter_content(page, content_html):
     """본문 입력 - SmartEditor ONE
-    핵심: Playwright의 실제 click()으로 input_buffer body에 포커스를 준 뒤
-    execCommand('insertHTML') 실행. click 없이 JS만으로는 React 상태 미갱신.
+
+    핵심 발견: 페이지 로드 시 존재하는 input_buffer 프레임은 '제목' 편집 프레임임.
+    본문 영역 클릭 후 SmartEditor가 본문용 input_buffer 프레임을 새로 생성함.
+    따라서 제목 입력 후 Tab으로 이동 → 새로 생긴 input_buffer 프레임에 내용 삽입.
     """
     safe_html = content_html.replace("`", "'").replace("\\", "\\\\").replace("\n", "")
 
-    # input_buffer 프레임 탐색 (SmartEditor ONE 본문 편집 iframe)
-    input_frame = None
-    for f in page.frames:
-        if f.name.startswith("input_buffer"):
-            input_frame = f
-            break
+    # 현재 input_buffer 프레임 목록 기록 (=제목 프레임들)
+    title_frame_names = {f.name for f in page.frames if f.name.startswith("input_buffer")}
+    logger.info(f"제목 프레임 목록: {title_frame_names}")
 
-    if not input_frame:
-        logger.warning("input_buffer 프레임 없음 — 프레임 목록: " +
-                       str([(f.name or "noname", f.url[:30]) for f in page.frames]))
+    # Tab 키로 본문 영역으로 이동 → SmartEditor가 본문용 input_buffer 생성
+    await page.keyboard.press("Tab")
+    await page.wait_for_timeout(1500)
+
+    # 새로 생긴 input_buffer 프레임 탐색 (본문 프레임)
+    all_ib = [f for f in page.frames if f.name.startswith("input_buffer")]
+    body_frames = [f for f in all_ib if f.name not in title_frame_names]
+    logger.info(f"Tab 후 input_buffer 프레임: {[f.name for f in all_ib]}, 본문 후보: {[f.name for f in body_frames]}")
+
+    if not body_frames:
+        # 새 프레임이 없으면 mainFrame에서 본문 영역 직접 클릭
+        main_frame = page.frame(name="mainFrame")
+        if main_frame:
+            for sel in ['.se-section-documenttext', '.se-content', '.se-component']:
+                try:
+                    loc = main_frame.locator(sel).first
+                    if await loc.count() > 0:
+                        await loc.click()
+                        await page.wait_for_timeout(1500)
+                        break
+                except Exception:
+                    continue
+        # 다시 탐색
+        all_ib = [f for f in page.frames if f.name.startswith("input_buffer")]
+        body_frames = [f for f in all_ib if f.name not in title_frame_names]
+        logger.info(f"클릭 후 재탐색: {[f.name for f in all_ib]}")
+
+    if not body_frames:
+        logger.warning("본문 input_buffer 프레임 없음 — 사용 가능한 프레임: " +
+                       str([f.name for f in page.frames]))
         return
 
-    try:
-        # body가 transform:rotateX(90deg)로 비가시 상태일 수 있음 → force=True
-        # 또는 JS click으로 가시성 체크 우회
-        try:
-            await input_frame.locator("body").click(force=True, timeout=5000)
-            await page.wait_for_timeout(400)
-            logger.info("본문 body 클릭 완료 (force)")
-        except Exception:
-            # force click도 실패하면 JS click
-            await input_frame.evaluate("document.body.click(); document.body.focus()")
-            await page.wait_for_timeout(400)
-            logger.info("본문 body JS click 사용")
+    body_frame = body_frames[0]
 
-        # 전체 선택 후 HTML 삽입
-        await input_frame.evaluate("document.execCommand('selectAll', false, null)")
-        ok = await input_frame.evaluate(f"document.execCommand('insertHTML', false, `{safe_html}`)")
+    try:
+        await body_frame.evaluate("document.body.click(); document.body.focus()")
+        await page.wait_for_timeout(300)
+        await body_frame.evaluate("document.execCommand('selectAll', false, null)")
+        ok = await body_frame.evaluate(f"document.execCommand('insertHTML', false, `{safe_html}`)")
 
         if ok:
-            logger.info(f"본문 입력 완료: insertHTML (frame: {input_frame.name})")
+            logger.info(f"본문 입력 완료: insertHTML (frame: {body_frame.name})")
         else:
-            # insertHTML이 false 반환 시 innerHTML 직접 설정
-            await input_frame.evaluate(f"document.body.innerHTML = `{safe_html}`")
-            await input_frame.evaluate("""
-                document.body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}));
-            """)
-            logger.info(f"본문 입력 완료: innerHTML 폴백 (frame: {input_frame.name})")
+            await body_frame.evaluate(f"document.body.innerHTML = `{safe_html}`")
+            await body_frame.evaluate(
+                "document.body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}))"
+            )
+            logger.info(f"본문 입력 완료: innerHTML 폴백 (frame: {body_frame.name})")
 
     except Exception as e:
         logger.error(f"본문 입력 실패: {e}")
