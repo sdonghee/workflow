@@ -47,7 +47,10 @@ def load_cookies(cookie_file):
     if not os.path.exists(cookie_file):
         return None
     with open(cookie_file, "r", encoding="utf-8") as f:
-        return json.load(f)
+        content = f.read().strip()
+        if not content:
+            return None
+        return json.loads(content)
 
 
 # ─────────────────────────────────────────
