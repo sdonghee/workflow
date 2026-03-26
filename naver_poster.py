@@ -648,11 +648,21 @@ _CONFIRM_JS = """
         if (btn) { btn.click(); return 'kw:' + kw + ':' + btn.className.substring(0, 30); }
     }
 
-    // 2. 툴바 외 '발행' 버튼 (= 패널의 발행 버튼)
+    // 2. 툴바 외 '발행' 버튼 탐색
+    // 버튼이 2개인 경우: [0]=에디터 헤더 버튼(패널 열기용, y값 작음), [1]=패널 확인 버튼(y값 큼)
+    // getBoundingClientRect().y가 가장 큰 버튼 = 화면 아래쪽 = 패널 확인 버튼
     var publishBtns = candidates.filter(function(b) { return b.textContent.trim() === '발행'; });
     if (publishBtns.length > 0) {
-        publishBtns[0].click();
-        return 'non-toolbar-publish:' + publishBtns.length + ':' + publishBtns[0].className.substring(0, 40);
+        var btnsDebug = publishBtns.map(function(b, i) {
+            var rect = b.getBoundingClientRect();
+            return i + '(y=' + Math.round(rect.y) + ',cls=' + b.className.substring(0, 20) + ')';
+        }).join('|');
+        // y좌표가 가장 큰(화면 아래쪽) 버튼 클릭 = 패널 안의 확인 발행 버튼
+        var targetBtn = publishBtns.reduce(function(max, b) {
+            return b.getBoundingClientRect().y > max.getBoundingClientRect().y ? b : max;
+        });
+        targetBtn.click();
+        return 'publish:cnt=' + publishBtns.length + ':btns=[' + btnsDebug + ']:clicked_y=' + Math.round(targetBtn.getBoundingClientRect().y);
     }
 
     // 3. 디버그: 후보 버튼 목록 반환
