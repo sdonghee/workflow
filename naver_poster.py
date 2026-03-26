@@ -276,50 +276,67 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 # ─────────────────────────────────────────
 
 async def _enter_title(page, title):
-    """제목 입력 - SmartEditor ONE (mainFrame → child frames 순으로 탐색)"""
-    title_selectors = [
-        ".se-title-input",
-        ".se-title__input",
-        "div[contenteditable][class*='title']",
-    ]
-
-    # mainFrame 직접 접근 후 child frames 포함 탐색
+    """제목 입력 - SmartEditor ONE (SmartEditor 초기화 완료 후 탐색)"""
     main_frame = page.frame(name="mainFrame")
-    search_frames = []
-    if main_frame:
-        search_frames.append(main_frame)
-        search_frames.extend(main_frame.child_frames)
-    # 나머지 frames fallback
-    for f in page.frames:
-        if f not in search_frames:
-            search_frames.append(f)
+    if not main_frame:
+        logger.warning("제목 입력 실패: mainFrame 없음")
+        return
 
-    for frame in search_frames:
-        for sel in title_selectors:
-            try:
-                el = await frame.query_selector(sel)
-                if el:
-                    await el.click()
-                    await page.wait_for_timeout(300)
-                    await page.keyboard.press("Control+a")
-                    await page.keyboard.type(title)
-                    logger.info(f"제목 입력: {title[:30]}")
-                    return
-            except Exception:
-                continue
+    # SmartEditor가 초기화될 때까지 .se-title-input 대기 (최대 15초)
+    try:
+        await main_frame.wait_for_selector(
+            ".se-title-input, div[contenteditable][class*='title']",
+            timeout=15000
+        )
+        await page.wait_for_timeout(500)
+    except Exception:
+        logger.warning("제목 입력 실패: .se-title-input 미발견 (SmartEditor 초기화 지연?)")
+        return
 
-    logger.warning("제목 입력 실패")
+    # JS로 직접 입력 (execCommand 방식 - contenteditable에서 가장 안정적)
+    result = await main_frame.evaluate("""
+        (title) => {
+            var el = document.querySelector('.se-title-input') ||
+                     document.querySelector('div[contenteditable][class*="title"]');
+            if (!el) return false;
+            el.focus();
+            el.innerHTML = '';
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, title);
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            return el.className || 'title-found';
+        }
+    """, title)
+
+    if result:
+        logger.info(f"제목 입력 완료: {title[:30]} (el: {result})")
+    else:
+        logger.warning("제목 입력 실패: 요소 없음")
 
 
 async def _enter_content(page, content_html):
     """본문 입력 - SmartEditor ONE (body[contenteditable] 우선 탐색)"""
     safe_html = content_html.replace("`", "'").replace("\\", "\\\\").replace("\n", "")
 
+    # input_buffer 프레임 우선 탐색 (SmartEditor ONE의 실제 편집 iframe)
+    input_frame = None
+    for f in page.frames:
+        if f.name.startswith("input_buffer"):
+            input_frame = f
+            break
+
     main_frame = page.frame(name="mainFrame")
+
+    # 탐색 순서: input_buffer → mainFrame child_frames → mainFrame → 나머지
     search_frames = []
+    if input_frame:
+        search_frames.append(input_frame)
     if main_frame:
-        search_frames.append(main_frame)
-        search_frames.extend(main_frame.child_frames)
+        for cf in main_frame.child_frames:
+            if cf not in search_frames:
+                search_frames.append(cf)
+        if main_frame not in search_frames:
+            search_frames.append(main_frame)
     for f in page.frames:
         if f not in search_frames:
             search_frames.append(f)
@@ -328,12 +345,8 @@ async def _enter_content(page, content_html):
         try:
             result = await frame.evaluate(f"""
                 (function() {{
-                    // 1) body 자체가 contenteditable (SmartEditor 내부 편집 frame)
-                    //    rotateX(90deg)로 숨겨져 있어도 innerHTML 직접 수정 가능
+                    // 1) body 자체가 contenteditable (input_buffer 프레임)
                     if (document.body && document.body.contentEditable === 'true') {{
-                        // CSS transform 제거 (혹시 필요시)
-                        document.body.style.transform = '';
-                        document.body.style.display = 'block';
                         document.body.innerHTML = `{safe_html}`;
                         document.body.dispatchEvent(new Event('input', {{bubbles: true}}));
                         document.body.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
@@ -364,7 +377,7 @@ async def _enter_content(page, content_html):
                 }})()
             """)
             if result:
-                logger.info(f"본문 입력 완료: {result}")
+                logger.info(f"본문 입력 완료: {result} (frame: {frame.name or frame.url[:40]})")
                 return
         except Exception:
             continue
@@ -420,16 +433,24 @@ _PUBLISH_JS = """
 
 _CONFIRM_JS = """
 (function() {
-    var keywords = ['공개발행', '전체공개', '확인', '발행하기'];
-    var all = Array.from(document.querySelectorAll('button, a'));
+    // Naver 발행 확인 패널: '공개발행', '전체공개', '발행하기', '확인' 버튼 탐색
+    var keywords = ['공개발행', '발행하기', '전체공개', '확인'];
+    var all = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
     for (var kw of keywords) {
-        var btn = all.find(function(b) { return b.textContent.trim().includes(kw); });
-        if (btn) { btn.click(); return 'confirm:' + kw; }
+        var btn = all.find(function(b) {
+            var t = (b.textContent || b.value || '').trim();
+            return t === kw || t.includes(kw);
+        });
+        if (btn && btn.offsetParent !== null) {
+            // offsetParent !== null 이면 실제로 보이는 요소
+            btn.click();
+            return 'confirm:' + kw;
+        }
     }
-    // .btn_confirm, .btn_ok
-    for (var cls of ['.btn_confirm', '.btn_ok', '.btn-primary']) {
+    // CSS class 기반
+    for (var cls of ['.btn_confirm', '.btn_ok', '.btn-primary', '.publish_btn']) {
         var el = document.querySelector(cls);
-        if (el) { el.click(); return 'css-confirm:' + cls; }
+        if (el && el.offsetParent !== null) { el.click(); return 'css-confirm:' + cls; }
     }
     return false;
 })()
@@ -476,31 +497,41 @@ async def _publish(page):
         logger.error("발행 버튼 없음")
         return False
 
-    # 2단계: 확인/공개발행 모달 (JS 텍스트 탐색)
-    for attempt in range(5):
-        await page.wait_for_timeout(1000)
+    # 2단계: 발행 확인 패널 처리 (클릭 후 패널이 열리기까지 대기 후 반복 탐색)
+    # Naver: 발행 버튼 → 공개 설정 패널 → '공개발행' 또는 '발행하기' 버튼
+    logger.info("발행 확인 패널 대기 중...")
+    await page.wait_for_timeout(3000)  # 패널 애니메이션 대기
+
+    for attempt in range(8):
+        await page.wait_for_timeout(1500)
+        confirmed = False
+
+        # 메인 페이지에서 먼저
         try:
             result = await page.evaluate(_CONFIRM_JS)
             if result:
                 logger.info(f"발행 확인: {result}")
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(3000)
                 return True
         except Exception:
             pass
-        # frames에서도 확인 모달 탐색
+
+        # frames에서 탐색
         for frame in search_frames:
             try:
                 result = await frame.evaluate(_CONFIRM_JS)
                 if result:
-                    logger.info(f"발행 확인(frame): {result}")
-                    await page.wait_for_timeout(2000)
+                    logger.info(f"발행 확인(frame/{frame.name or 'noname'}): {result}")
+                    await page.wait_for_timeout(3000)
                     return True
             except Exception:
                 continue
 
-    # 확인 버튼 없어도 이미 발행된 경우
-    await page.wait_for_timeout(2000)
-    return True
+        if attempt == 0:
+            logger.info("확인 버튼 미발견, 계속 탐색 중...")
+
+    logger.warning("발행 확인 버튼 미발견 — 발행이 완료되지 않았을 수 있음")
+    return False
 
 
 # ─────────────────────────────────────────
