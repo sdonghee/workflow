@@ -14,6 +14,7 @@ services:
       - ./naver_blog_auto.log:/app/naver_blog_auto.log
       - ./drafts:/app/drafts
       - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
     environment:
       - HEADLESS=true
     shm_size: '256mb'

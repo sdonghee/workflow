@@ -12,7 +12,25 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from config import HEADLESS
 
+SCREENSHOT_DIR = "/app/screenshots"
+
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────
+# 스크린샷 저장 헬퍼
+# ─────────────────────────────────────────
+
+async def _screenshot(page, step: str, run_id: str):
+    """현재 화면을 screenshots/{run_id}/{step}.png 로 저장"""
+    try:
+        dir_path = os.path.join(SCREENSHOT_DIR, run_id)
+        os.makedirs(dir_path, exist_ok=True)
+        path = os.path.join(dir_path, f"{step}.png")
+        await page.screenshot(path=path, full_page=False)
+        logger.info(f"[스크린샷] {path}")
+    except Exception as e:
+        logger.warning(f"[스크린샷 실패] {step}: {e}")
 
 
 # ─────────────────────────────────────────
@@ -170,6 +188,9 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
     네이버 블로그에 글 포스팅
     blog_config: BLOGS dict의 개별 블로그 설정
     """
+    # 실행마다 고유 폴더에 스크린샷 저장 (예: 20260326_153012)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{blog_config.get('blog_id','')}"
+
     async with async_playwright() as p:
         browser, browser_type = await _launch_browser(p)
 
@@ -205,8 +226,6 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
                 save_cookies(cookies, blog_config["cookie_file"])
 
             # 3. 글쓰기 페이지 이동
-            # 실제 글쓰기 URL: blog.naver.com/{blog_id}?Redirect=Write&categoryNo=0
-            # 이 URL이 mainFrame iframe을 포함한 올바른 구조를 반환함
             blog_id = blog_config["blog_id"]
             write_url = f"https://blog.naver.com/{blog_id}?Redirect=Write&categoryNo=0"
             await page.goto(write_url, wait_until="domcontentloaded")
@@ -219,7 +238,7 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 
             logger.info(f"[{blog_config['name']}] 글쓰기 페이지: {page.url}")
 
-            # mainFrame 로드 대기 (iframe이 async로 삽입되므로 DOM에 나타날 때까지 대기)
+            # mainFrame 로드 대기
             try:
                 await page.wait_for_selector(
                     "iframe[name='mainFrame'], iframe#mainFrame",
@@ -229,7 +248,6 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             except Exception:
                 logger.warning("mainFrame iframe DOM 미발견, 계속 진행")
 
-            # 모든 frame 목록 로그 (디버깅)
             frame_info = [(f.name or "noname", f.url[:60]) for f in page.frames]
             logger.info(f"로드된 frames({len(frame_info)}개): {frame_info}")
 
@@ -244,11 +262,17 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             else:
                 logger.warning("mainFrame frame 객체 없음, 계속 진행")
 
+            # [스크린샷 1] 글쓰기 페이지 로드 직후
+            await _screenshot(page, "01_write_page_loaded", run_id)
+
             # 4. 제목 입력
             await _enter_title(page, title)
             await page.wait_for_timeout(1500)
 
-            # 5. 본문 입력 (태그를 본문 끝 해시태그로 추가 - Naver 자동 인식)
+            # [스크린샷 2] 제목 입력 후
+            await _screenshot(page, "02_after_title", run_id)
+
+            # 5. 본문 입력 (태그를 본문 끝 해시태그로 추가)
             tag_list = [t.strip() for t in tags.split(",") if t.strip()][:10]
             if tag_list:
                 tag_line = " ".join(f"#{t}" for t in tag_list)
@@ -258,21 +282,38 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             await _enter_content(page, content_with_tags)
             await page.wait_for_timeout(1500)
 
-            # 7. 발행
-            success = await _publish(page)
+            # [스크린샷 3] 본문 입력 후
+            await _screenshot(page, "03_after_content", run_id)
+
+            # 6. 발행
+            success = await _publish(page, run_id)
+
+            # [스크린샷 6] 발행 후 최종 상태
+            await _screenshot(page, "06_after_publish", run_id)
 
             if success:
                 cookies = await context.cookies()
                 save_cookies(cookies, blog_config["cookie_file"])
-                logger.info(f"[{blog_config['name']}] ✅ 포스팅 완료: {title}")
 
+                # 7. 실제 블로그에서 포스팅 검증
+                verified = await _verify_posted(page, blog_id, title)
+                if verified:
+                    logger.info(f"[{blog_config['name']}] ✅ 포스팅 확인 완료: {title}")
+                else:
+                    logger.error(f"[{blog_config['name']}] ❌ 발행 클릭했지만 블로그에서 글을 찾을 수 없음: {title}")
+                    await _screenshot(page, "07_verify_failed", run_id)
+                    return False
+
+            logger.info(f"[스크린샷 폴더] {SCREENSHOT_DIR}/{run_id}/")
             return success
 
         except PlaywrightTimeout as e:
             logger.error(f"[{blog_config['name']}] 타임아웃 오류: {e}")
+            await _screenshot(page, "error_timeout", run_id)
             return False
         except Exception as e:
             logger.error(f"[{blog_config['name']}] 포스팅 오류: {e}", exc_info=True)
+            await _screenshot(page, "error_exception", run_id)
             return False
         finally:
             await page.wait_for_timeout(1000)
@@ -468,7 +509,22 @@ _CONFIRM_JS = """
 """
 
 
-async def _publish(page):
+async def _verify_posted(page, blog_id: str, title: str) -> bool:
+    """발행 후 실제 블로그에서 글 제목 확인 (최근 5개 포스트 검색)"""
+    try:
+        blog_url = f"https://blog.naver.com/{blog_id}"
+        await page.goto(blog_url, wait_until="domcontentloaded", timeout=15000)
+        await page.wait_for_timeout(3000)
+        content = await page.content()
+        found = title in content
+        logger.info(f"[검증] 블로그({blog_url}) 에서 '{title[:20]}' {'발견 ✅' if found else '미발견 ❌'}")
+        return found
+    except Exception as e:
+        logger.warning(f"[검증] 블로그 확인 실패: {e}")
+        return False
+
+
+async def _publish(page, run_id: str = ""):
     """발행 버튼 클릭 - SmartEditor ONE (JS 기반, has-text 제거로 timeout 방지)"""
     main_frame = page.frame(name="mainFrame")
     search_frames = []
@@ -506,12 +562,18 @@ async def _publish(page):
 
     if not clicked:
         logger.error("발행 버튼 없음")
+        await _screenshot(page, "04_publish_btn_notfound", run_id)
         return False
 
+    # [스크린샷 4] 첫 번째 발행 버튼 클릭 직후 (패널이 열렸는지 확인)
+    await _screenshot(page, "04_after_publish_click", run_id)
+
     # 2단계: 발행 확인 패널 처리 (클릭 후 패널이 열리기까지 대기 후 반복 탐색)
-    # Naver: 발행 버튼 → 공개 설정 패널 → '공개발행' 또는 '발행하기' 버튼
     logger.info("발행 확인 패널 대기 중...")
     await page.wait_for_timeout(3000)  # 패널 애니메이션 대기
+
+    # [스크린샷 5] 패널 대기 후 (패널 내용 확인)
+    await _screenshot(page, "05_publish_panel", run_id)
 
     for attempt in range(8):
         await page.wait_for_timeout(1500)
