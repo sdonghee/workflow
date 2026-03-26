@@ -1,7 +1,15 @@
 """빠른 테스트 포스팅 - AI 생성 없이 고정 내용으로 바로 포스팅"""
 import asyncio
+import logging
 from config import BLOGS
 from naver_poster import post_to_naver_blog
+
+# 로그를 stdout으로 출력
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 TITLE = "테스트 포스팅입니다"
 CONTENT = """<p>안녕하세요! 자동 포스팅 테스트입니다.</p>
