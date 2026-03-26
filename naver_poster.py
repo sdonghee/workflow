@@ -363,7 +363,7 @@ async def _enter_title(page, title):
             logger.debug(f"제목 selector 시도 실패 ({sel}): {e}")
             continue
 
-    # 최후 폴백: JS로 첫 번째 contenteditable 요소를 직접 찾아 click
+    # 최후 폴백: JS로 첫 번째 contenteditable 요소를 직접 click/focus 후 keyboard.type
     try:
         result = await main_frame.evaluate("""
             () => {
@@ -374,19 +374,17 @@ async def _enter_title(page, title):
                         .map(function(e) { return e.tagName + '.' + (e.className||'').substring(0,30); }).join('|');
                     return 'not_found:' + debug;
                 }
-                // getBoundingClientRect으로 좌표 반환 → Playwright에서 클릭
-                var rect = el.getBoundingClientRect();
-                return JSON.stringify({x: rect.left + rect.width/2, y: rect.top + rect.height/2, cls: el.className.substring(0,40)});
+                // Frame에는 .mouse가 없으므로 JS로 직접 click/focus
+                el.click();
+                el.focus();
+                return 'ok:' + el.className.substring(0, 40);
             }
         """)
-        if result and not result.startswith('not_found'):
-            import json as _json
-            info = _json.loads(result)
-            await main_frame.mouse.click(info['x'], info['y'])
-            await page.wait_for_timeout(400)
+        if result and result.startswith('ok:'):
+            await page.wait_for_timeout(300)
             await page.keyboard.press("Control+a")
             await page.keyboard.type(title, delay=40)
-            logger.info(f"제목 입력 완료 (폴백 클릭): {title[:30]} cls={info.get('cls','')}")
+            logger.info(f"제목 입력 완료 (JS click 폴백): {title[:30]} {result}")
         else:
             logger.warning(f"제목 입력 실패: {result}")
     except Exception as e:
@@ -413,9 +411,17 @@ async def _enter_content(page, content_html):
         return
 
     try:
-        # Playwright 실제 클릭으로 body 포커스 (OS 레벨 포커스 이벤트 트리거)
-        await input_frame.locator("body").click()
-        await page.wait_for_timeout(400)
+        # body가 transform:rotateX(90deg)로 비가시 상태일 수 있음 → force=True
+        # 또는 JS click으로 가시성 체크 우회
+        try:
+            await input_frame.locator("body").click(force=True, timeout=5000)
+            await page.wait_for_timeout(400)
+            logger.info("본문 body 클릭 완료 (force)")
+        except Exception:
+            # force click도 실패하면 JS click
+            await input_frame.evaluate("document.body.click(); document.body.focus()")
+            await page.wait_for_timeout(400)
+            logger.info("본문 body JS click 사용")
 
         # 전체 선택 후 HTML 삽입
         await input_frame.evaluate("document.execCommand('selectAll', false, null)")
@@ -426,7 +432,6 @@ async def _enter_content(page, content_html):
         else:
             # insertHTML이 false 반환 시 innerHTML 직접 설정
             await input_frame.evaluate(f"document.body.innerHTML = `{safe_html}`")
-            # 수동으로 input 이벤트 발생
             await input_frame.evaluate("""
                 document.body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}));
             """)
