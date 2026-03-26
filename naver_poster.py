@@ -265,6 +265,11 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             # [스크린샷 1] 글쓰기 페이지 로드 직후
             await _screenshot(page, "01_write_page_loaded", run_id)
 
+            # 3-1. "작성 중인 글이 있습니다" HTML 팝업 처리
+            # (브라우저 native dialog가 아닌 HTML 모달 → page.on("dialog") 미처리)
+            await _dismiss_draft_popup(page)
+            await page.wait_for_timeout(800)
+
             # 4. 제목 입력
             await _enter_title(page, title)
             await page.wait_for_timeout(1500)
@@ -323,6 +328,25 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 # ─────────────────────────────────────────
 # 세부 동작 함수들
 # ─────────────────────────────────────────
+
+async def _dismiss_draft_popup(page):
+    """'작성 중인 글이 있습니다' HTML 팝업을 '취소'로 닫기 (이전 초안 버리고 새로 시작)"""
+    main_frame = page.frame(name="mainFrame")
+    if not main_frame:
+        return
+    try:
+        result = await main_frame.evaluate("""
+            () => {
+                var btns = Array.from(document.querySelectorAll('button'));
+                var cancelBtn = btns.find(b => b.textContent.trim() === '취소');
+                if (cancelBtn) { cancelBtn.click(); return 'dismissed'; }
+                return 'no_popup';
+            }
+        """)
+        logger.info(f"초안 팝업 처리: {result}")
+    except Exception as e:
+        logger.debug(f"초안 팝업 확인 중 오류: {e}")
+
 
 async def _enter_title(page, title):
     """제목 입력 - SmartEditor ONE
