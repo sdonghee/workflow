@@ -293,6 +293,19 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             await _dismiss_draft_popup(page)
             await page.wait_for_timeout(800)
 
+            # 3-2. SmartEditor ONE 본문 영역 로드 완료 대기
+            # (초안 팝업 없는 계정은 대기 없이 바로 진행 → 에디터 미초기화 상태로 클릭)
+            if main_frame:
+                try:
+                    await main_frame.wait_for_selector(
+                        '.se-placeholder, .se-component.se-text',
+                        timeout=8000
+                    )
+                    await page.wait_for_timeout(1000)
+                    logger.info("SmartEditor 본문 영역 로드 완료")
+                except Exception:
+                    logger.warning("SmartEditor 본문 영역 로드 대기 타임아웃, 계속 진행")
+
             # 4. 제목 입력
             await _enter_title(page, title)
             await page.wait_for_timeout(1500)
@@ -503,10 +516,16 @@ async def _enter_content(page, content_html):
         await page.keyboard.press("Tab")
         await page.wait_for_timeout(800)
 
-    # ── input_buffer 상태 진단 ──────────────────────────────────────
-    input_frame = next((f for f in page.frames if f.name.startswith("input_buffer")), None)
+    # ── input_buffer 대기 (클릭 후 SmartEditor가 준비될 때까지) ────
+    input_frame = None
+    for wait_i in range(12):
+        input_frame = next((f for f in page.frames if f.name.startswith("input_buffer")), None)
+        if input_frame:
+            break
+        await page.wait_for_timeout(500)
+        logger.debug(f"input_buffer 대기 중... {wait_i + 1}/12")
     if not input_frame:
-        logger.warning("input_buffer 프레임 없음")
+        logger.warning("input_buffer 프레임 없음 (6초 대기 후에도)")
         return
 
     logger.info(f"본문 삽입 프레임: {input_frame.name}")
