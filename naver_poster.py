@@ -424,67 +424,164 @@ async def _enter_title(page, title):
 async def _enter_content(page, content_html):
     """본문 입력 - SmartEditor ONE
 
-    핵심 발견: 페이지 로드 시 존재하는 input_buffer 프레임은 '제목' 편집 프레임임.
-    본문 영역 클릭 후 SmartEditor가 본문용 input_buffer 프레임을 새로 생성함.
-    따라서 제목 입력 후 Tab으로 이동 → 새로 생긴 input_buffer 프레임에 내용 삽입.
+    핵심: mainFrame의 본문 영역을 Playwright click()으로 포커스한 뒤
+    input_buffer에서 insertHTML. execCommand는 선택 없으면 true를 반환해도
+    실제로 삽입되지 않으므로 innerHTML 길이 변화로 검증.
     """
     safe_html = content_html.replace("`", "'").replace("\\", "\\\\").replace("\n", "")
 
-    # 현재 input_buffer 프레임 목록 기록 (=제목 프레임들)
-    title_frame_names = {f.name for f in page.frames if f.name.startswith("input_buffer")}
-    logger.info(f"제목 프레임 목록: {title_frame_names}")
-
-    # Tab 키로 본문 영역으로 이동 → SmartEditor가 본문용 input_buffer 생성
-    await page.keyboard.press("Tab")
-    await page.wait_for_timeout(1500)
-
-    # 새로 생긴 input_buffer 프레임 탐색 (본문 프레임)
-    all_ib = [f for f in page.frames if f.name.startswith("input_buffer")]
-    body_frames = [f for f in all_ib if f.name not in title_frame_names]
-    logger.info(f"Tab 후 input_buffer 프레임: {[f.name for f in all_ib]}, 본문 후보: {[f.name for f in body_frames]}")
-
-    if not body_frames:
-        # 새 프레임이 없으면 mainFrame에서 본문 영역 직접 클릭
-        main_frame = page.frame(name="mainFrame")
-        if main_frame:
-            for sel in ['.se-section-documenttext', '.se-content', '.se-component']:
-                try:
-                    loc = main_frame.locator(sel).first
-                    if await loc.count() > 0:
-                        await loc.click()
-                        await page.wait_for_timeout(1500)
-                        break
-                except Exception:
-                    continue
-        # 다시 탐색
-        all_ib = [f for f in page.frames if f.name.startswith("input_buffer")]
-        body_frames = [f for f in all_ib if f.name not in title_frame_names]
-        logger.info(f"클릭 후 재탐색: {[f.name for f in all_ib]}")
-
-    if not body_frames:
-        logger.warning("본문 input_buffer 프레임 없음 — 사용 가능한 프레임: " +
-                       str([f.name for f in page.frames]))
+    main_frame = page.frame(name="mainFrame")
+    if not main_frame:
+        logger.warning("본문 입력 실패: mainFrame 없음")
         return
 
-    body_frame = body_frames[0]
+    # ── mainFrame 구조 진단 ─────────────────────────────────────────
+    try:
+        mf_debug = await main_frame.evaluate("""
+            () => {
+                var ces = Array.from(document.querySelectorAll('[contenteditable]'));
+                var placeholders = Array.from(document.querySelectorAll('[class*="placeholder"]'));
+                var components = Array.from(document.querySelectorAll('.se-component, .se-section'));
+                return {
+                    contentEditables: ces.map(e => e.tagName + '.' + (e.className||'').substring(0,30)).join('|'),
+                    placeholders: placeholders.map(e => e.tagName + '.' + (e.className||'').substring(0,30)).join('|'),
+                    components: components.slice(0,5).map(e => e.tagName + '.' + (e.className||'').substring(0,30)).join('|')
+                };
+            }
+        """)
+        logger.info(f"mainFrame 구조: CE={mf_debug['contentEditables'][:100]}")
+        logger.info(f"  placeholders: {mf_debug['placeholders'][:100]}")
+        logger.info(f"  components:   {mf_debug['components'][:100]}")
+    except Exception as e:
+        logger.debug(f"mainFrame 진단 실패: {e}")
+
+    # ── 방법 1: mainFrame의 본문 영역 직접 Playwright click() ───────
+    # SmartEditor ONE: 클릭해야 input_buffer에 커서가 본문 위치로 이동
+    body_selectors = [
+        'p.se-placeholder',
+        '.se-placeholder',
+        '.se-component-content .se-text',
+        '.se-section-body .se-component .se-component-content',
+        '.se-main-section',
+        '.se-component:not(.se-component-title)',
+    ]
+
+    clicked_body = False
+    for sel in body_selectors:
+        try:
+            loc = main_frame.locator(sel).first
+            cnt = await loc.count()
+            if cnt == 0:
+                continue
+            await loc.click(force=True)
+            await page.wait_for_timeout(800)
+            logger.info(f"본문 영역 클릭 성공: {sel} (count={cnt})")
+            clicked_body = True
+            break
+        except Exception as e:
+            logger.debug(f"본문 selector 클릭 실패 ({sel}): {e}")
+
+    if not clicked_body:
+        logger.info("본문 selector 클릭 실패 → Tab 폴백")
+        await page.keyboard.press("Tab")
+        await page.wait_for_timeout(800)
+
+    # ── input_buffer 상태 진단 ──────────────────────────────────────
+    input_frame = next((f for f in page.frames if f.name.startswith("input_buffer")), None)
+    if not input_frame:
+        logger.warning("input_buffer 프레임 없음")
+        return
+
+    logger.info(f"본문 삽입 프레임: {input_frame.name}")
 
     try:
-        await body_frame.evaluate("document.body.click(); document.body.focus()")
-        await page.wait_for_timeout(300)
-        await body_frame.evaluate("document.execCommand('selectAll', false, null)")
-        ok = await body_frame.evaluate(f"document.execCommand('insertHTML', false, `{safe_html}`)")
+        # 삽입 전 상태 진단
+        diag = await input_frame.evaluate("""
+            () => {
+                var sel = window.getSelection();
+                var selInfo = 'no_selection';
+                if (sel && sel.rangeCount > 0) {
+                    var range = sel.getRangeAt(0);
+                    var node = range.startContainer;
+                    selInfo = (node.nodeType === 3 ? 'text:' + node.textContent.substring(0,20)
+                               : (node.className || node.tagName || 'unknown'))
+                              + '@' + range.startOffset;
+                }
+                return {
+                    hasFocus: document.hasFocus(),
+                    bodyLen: document.body.innerHTML.length,
+                    bodyPreview: document.body.innerHTML.substring(0, 120),
+                    children: Array.from(document.body.children).map(
+                        e => e.tagName + '.' + (e.className||'').substring(0,20)
+                    ).join('|'),
+                    sel: selInfo
+                };
+            }
+        """)
+        logger.info(f"input_buffer 진단: focus={diag['hasFocus']}, bodyLen={diag['bodyLen']}, sel={diag['sel']}")
+        logger.info(f"  body children: {diag['children']}")
+        logger.info(f"  body preview:  {diag['bodyPreview'][:80]}")
 
-        if ok:
-            logger.info(f"본문 입력 완료: insertHTML (frame: {body_frame.name})")
-        else:
-            await body_frame.evaluate(f"document.body.innerHTML = `{safe_html}`")
-            await body_frame.evaluate(
-                "document.body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}))"
-            )
-            logger.info(f"본문 입력 완료: innerHTML 폴백 (frame: {body_frame.name})")
+        before_len = diag['bodyLen']
+
+        # ── 1차: 현재 커서 위치에 insertHTML ────────────────────────
+        ok1 = await input_frame.evaluate(f"document.execCommand('insertHTML', false, `{safe_html}`)")
+        after_len1 = await input_frame.evaluate("document.body.innerHTML.length")
+        logger.info(f"1차 insertHTML: ok={ok1}, 길이 {before_len} → {after_len1}")
+
+        if after_len1 > before_len + 50:
+            logger.info("본문 입력 완료 (1차: insertHTML at cursor)")
+            return
+
+        # ── 2차: body 두 번째 자식 위치로 커서 강제 이동 후 insertHTML
+        logger.warning("1차 삽입 변화 미미 → 2차: 커서 이동 후 삽입")
+        result2 = await input_frame.evaluate(f"""
+            (function() {{
+                var body = document.body;
+                var children = Array.from(body.children);
+                if (children.length === 0) return 'no_children';
+                // 두 번째 자식이 있으면 두 번째, 없으면 첫 번째 끝으로 커서 이동
+                var targetEl = children.length > 1 ? children[1] : children[0];
+                var sel = window.getSelection();
+                var range = document.createRange();
+                range.selectNodeContents(targetEl);
+                range.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                var ok2 = document.execCommand('insertHTML', false, `{safe_html}`);
+                return 'ok=' + ok2 + ':len=' + body.innerHTML.length;
+            }})()
+        """)
+        after_len2 = await input_frame.evaluate("document.body.innerHTML.length")
+        logger.info(f"2차 삽입: {result2}, 길이 {after_len2}")
+
+        if after_len2 > before_len + 50:
+            logger.info("본문 입력 완료 (2차: cursor-moved insertHTML)")
+            return
+
+        # ── 3차: DOM 직접 삽입 (최후 수단) ─────────────────────────
+        logger.warning("3차: DOM 직접 조작")
+        result3 = await input_frame.evaluate(f"""
+            (function() {{
+                var body = document.body;
+                var children = Array.from(body.children);
+                var div = document.createElement('div');
+                div.innerHTML = `{safe_html}`;
+                // 두 번째 자식 이후에 삽입 (첫 번째는 제목)
+                var refNode = children.length > 1 ? children[1] : null;
+                if (refNode) {{
+                    body.insertBefore(div, refNode);
+                }} else {{
+                    body.appendChild(div);
+                }}
+                body.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
+                return 'dom:len=' + body.innerHTML.length;
+            }})()
+        """)
+        logger.info(f"3차 DOM 삽입: {result3}")
 
     except Exception as e:
-        logger.error(f"본문 입력 실패: {e}")
+        logger.error(f"본문 입력 실패: {e}", exc_info=True)
 
 
 async def _enter_tags(page, tags):
