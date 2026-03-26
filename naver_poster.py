@@ -596,7 +596,7 @@ async def _enter_content(page, content_html):
         after_len1 = await input_frame.evaluate("document.body.innerHTML.length")
         logger.info(f"1차 insertHTML: ok={ok1}, 길이 {before_len} → {after_len1}")
 
-        if after_len1 > before_len + 50:
+        if after_len1 > before_len + 10:
             logger.info("본문 입력 완료 (1차: insertHTML at cursor)")
             return
 
