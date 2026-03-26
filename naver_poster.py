@@ -244,6 +244,23 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 
             logger.info(f"[{blog_config['name']}] 글쓰기 페이지: {page.url}")
 
+            # 쿠키 만료로 로그인 페이지로 리다이렉트된 경우 재로그인
+            if "nidlogin" in page.url or ("naver.com" in page.url and "login" in page.url.lower()):
+                logger.warning(f"[{blog_config['name']}] 쿠키 만료 감지 (로그인 페이지 리다이렉트) → ID/PW 재로그인")
+                logged_in = await login_with_password(page, blog_config)
+                if not logged_in:
+                    logger.error(f"[{blog_config['name']}] ID/PW 재로그인 실패")
+                    return False
+                cookies = await context.cookies()
+                save_cookies(cookies, blog_config["cookie_file"])
+                await page.goto(write_url, wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+                if len(context.pages) > 1:
+                    page = context.pages[-1]
+                    await page.wait_for_load_state("domcontentloaded")
+                    await page.wait_for_timeout(3000)
+                logger.info(f"[{blog_config['name']}] 재로그인 후 글쓰기 페이지: {page.url}")
+
             # mainFrame 로드 대기
             try:
                 await page.wait_for_selector(
