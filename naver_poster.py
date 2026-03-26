@@ -199,8 +199,10 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
                 save_cookies(cookies, blog_config["cookie_file"])
 
             # 3. 글쓰기 페이지 이동
+            # 실제 글쓰기 URL: blog.naver.com/{blog_id}?Redirect=Write&categoryNo=0
+            # 이 URL이 mainFrame iframe을 포함한 올바른 구조를 반환함
             blog_id = blog_config["blog_id"]
-            write_url = f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}"
+            write_url = f"https://blog.naver.com/{blog_id}?Redirect=Write&categoryNo=0"
             await page.goto(write_url, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
 
@@ -326,10 +328,15 @@ async def _enter_content(page, content_html):
         try:
             result = await frame.evaluate(f"""
                 (function() {{
-                    // 1) body 자체가 contenteditable인 경우 (SmartEditor 내부 편집 frame)
+                    // 1) body 자체가 contenteditable (SmartEditor 내부 편집 frame)
+                    //    rotateX(90deg)로 숨겨져 있어도 innerHTML 직접 수정 가능
                     if (document.body && document.body.contentEditable === 'true') {{
+                        // CSS transform 제거 (혹시 필요시)
+                        document.body.style.transform = '';
+                        document.body.style.display = 'block';
                         document.body.innerHTML = `{safe_html}`;
                         document.body.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        document.body.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
                         return 'body-editable';
                     }}
                     // 2) .se-content 내 editable 영역
