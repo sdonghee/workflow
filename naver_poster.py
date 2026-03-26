@@ -242,12 +242,14 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             await _enter_title(page, title)
             await page.wait_for_timeout(1500)
 
-            # 5. 본문 입력
-            await _enter_content(page, content_html)
-            await page.wait_for_timeout(1500)
-
-            # 6. 태그 입력
-            await _enter_tags(page, tags)
+            # 5. 본문 입력 (태그를 본문 끝 해시태그로 추가 - Naver 자동 인식)
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()][:10]
+            if tag_list:
+                tag_line = " ".join(f"#{t}" for t in tag_list)
+                content_with_tags = content_html + f"<p>{tag_line}</p>"
+            else:
+                content_with_tags = content_html
+            await _enter_content(page, content_with_tags)
             await page.wait_for_timeout(1500)
 
             # 7. 발행
@@ -276,42 +278,51 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 # ─────────────────────────────────────────
 
 async def _enter_title(page, title):
-    """제목 입력 - SmartEditor ONE (SmartEditor 초기화 완료 후 탐색)"""
+    """제목 입력 - SmartEditor ONE"""
     main_frame = page.frame(name="mainFrame")
     if not main_frame:
         logger.warning("제목 입력 실패: mainFrame 없음")
         return
 
-    # SmartEditor가 초기화될 때까지 .se-title-input 대기 (최대 15초)
-    try:
-        await main_frame.wait_for_selector(
-            ".se-title-input, div[contenteditable][class*='title']",
-            timeout=15000
-        )
-        await page.wait_for_timeout(500)
-    except Exception:
-        logger.warning("제목 입력 실패: .se-title-input 미발견 (SmartEditor 초기화 지연?)")
-        return
+    await page.wait_for_timeout(1000)
 
-    # JS로 직접 입력 (execCommand 방식 - contenteditable에서 가장 안정적)
+    # JS로 mainFrame에서 제목 요소 탐색 (선택자 우선순위 순, 디버그 정보 반환)
     result = await main_frame.evaluate("""
         (title) => {
-            var el = document.querySelector('.se-title-input') ||
-                     document.querySelector('div[contenteditable][class*="title"]');
-            if (!el) return false;
+            var selectors = [
+                '.se-title-input',
+                'div[contenteditable="true"][class*="title"]',
+                'div[contenteditable="true"][aria-multiline="false"]',
+                'div[contenteditable="true"][data-placeholder]',
+            ];
+            var el = null;
+            for (var sel of selectors) {
+                el = document.querySelector(sel);
+                if (el) break;
+            }
+            // Fallback: mainFrame 내 첫 번째 contenteditable (body 제외)
+            if (!el) {
+                var all = Array.from(document.querySelectorAll('[contenteditable="true"]'));
+                el = all.find(function(e) { return e.tagName !== 'BODY'; });
+            }
+            if (!el) {
+                var allInfo = Array.from(document.querySelectorAll('[contenteditable]'));
+                return 'not_found:count=' + allInfo.length + ':' +
+                    allInfo.map(function(e) { return e.tagName + '.' + (e.className || '').substring(0, 40); }).join('|');
+            }
             el.focus();
             el.innerHTML = '';
             document.execCommand('selectAll', false, null);
             document.execCommand('insertText', false, title);
             el.dispatchEvent(new Event('input', {bubbles: true}));
-            return el.className || 'title-found';
+            return 'ok:' + (el.className || el.tagName);
         }
     """, title)
 
-    if result:
-        logger.info(f"제목 입력 완료: {title[:30]} (el: {result})")
+    if result and result.startswith('ok:'):
+        logger.info(f"제목 입력 완료: {title[:30]} ({result})")
     else:
-        logger.warning("제목 입력 실패: 요소 없음")
+        logger.warning(f"제목 입력 실패: {result}")
 
 
 async def _enter_content(page, content_html):
