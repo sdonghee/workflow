@@ -207,10 +207,16 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
 
         page = await context.new_page()
 
-        # 브라우저 다이얼로그(alert/confirm) 자동 처리 — 제목 없음 경고 등
+        # 브라우저 다이얼로그 처리
+        # beforeunload = 발행 후 페이지 이탈 → accept()로 허용
+        # 나머지(alert 등) = dismiss()로 닫기
         async def _on_dialog(dialog):
-            logger.warning(f"브라우저 다이얼로그: [{dialog.type}] {dialog.message}")
-            await dialog.dismiss()
+            if dialog.type == "beforeunload":
+                logger.info("브라우저 다이얼로그: [beforeunload] 발행 후 이탈 허용")
+                await dialog.accept()
+            else:
+                logger.warning(f"브라우저 다이얼로그: [{dialog.type}] {dialog.message}")
+                await dialog.dismiss()
         page.on("dialog", _on_dialog)
 
         try:
@@ -546,8 +552,21 @@ _CONFIRM_JS = """
 
 
 async def _verify_posted(page, blog_id: str, title: str) -> bool:
-    """발행 후 실제 블로그에서 글 제목 확인 (최근 5개 포스트 검색)"""
+    """발행 후 실제 블로그에서 글 제목 확인"""
     try:
+        # 발행 후 페이지가 이미 이동했는지 먼저 확인
+        await page.wait_for_timeout(2000)
+        current_url = page.url
+        logger.info(f"[검증] 현재 URL: {current_url[:80]}")
+
+        # 에디터 URL이 아닌 블로그 URL로 이동했으면 발행 성공
+        if ("PostWriteForm" not in current_url and
+                "Redirect=Write" not in current_url and
+                blog_id in current_url):
+            logger.info(f"[검증] 발행 후 블로그 URL 이동 확인 ✅: {current_url[:60]}")
+            return True
+
+        # 블로그 홈으로 이동해서 제목 검색
         blog_url = f"https://blog.naver.com/{blog_id}"
         await page.goto(blog_url, wait_until="domcontentloaded", timeout=15000)
         await page.wait_for_timeout(3000)
