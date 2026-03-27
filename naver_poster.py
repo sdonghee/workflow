@@ -55,32 +55,28 @@ def _ensure_xvfb() -> bool:
 
 
 def _xclip_write(html: str) -> bool:
-    """HTML을 X11 클립보드에 씀 (xclip 사용)"""
+    """HTML을 X11 클립보드에 씀 (xclip 사용)
+
+    xclip은 다른 프로세스가 클립보드를 요청할 때까지 실행 유지 (데몬 방식).
+    subprocess.run()으로 기다리면 타임아웃 → Popen()으로 백그라운드 실행해야 함.
+    """
     if not os.environ.get("DISPLAY"):
         return False
     try:
-        # text/html 타입으로 클립보드에 저장
-        r = subprocess.run(
+        # Popen: stdin으로 데이터 전달 후 백그라운드에서 대기
+        # xclip은 Ctrl+V(clipboard 요청)를 받으면 데이터 제공 후 종료
+        proc = subprocess.Popen(
             ["xclip", "-selection", "clipboard", "-t", "text/html"],
-            input=html.encode("utf-8"),
-            timeout=15,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        if r.returncode == 0:
-            logger.info(f"xclip text/html 저장 완료 ({len(html):,} bytes)")
-            return True
-        # 실패 시 plain text로 재시도
-        r2 = subprocess.run(
-            ["xclip", "-selection", "clipboard"],
-            input=html.encode("utf-8"),
-            timeout=15,
-            capture_output=True,
-        )
-        if r2.returncode == 0:
-            logger.info(f"xclip text 저장 완료 ({len(html):,} bytes)")
-            return True
-        logger.warning(f"xclip 실패 (rc={r.returncode}): {r.stderr.decode()[:100]}")
-        return False
+        proc.stdin.write(html.encode("utf-8"))
+        proc.stdin.close()
+        # 완료 대기 없음 - xclip이 클립보드 요청을 받을 때까지 실행 유지
+        time.sleep(0.3)  # xclip 클립보드 소유권 등록 대기
+        logger.info(f"xclip text/html 백그라운드 실행 ({len(html):,} bytes)")
+        return True
     except FileNotFoundError:
         logger.warning("xclip 없음")
         return False
@@ -735,20 +731,13 @@ async def _enter_content(page, content_html):
         xclip_ok = _xclip_write(content_html)
         if xclip_ok:
             try:
-                # about:blank body는 시각적으로 보이지 않아 locator click()이 타임아웃
-                # JS focus()로 직접 포커스 설정 (가시성 체크 없음)
-                await input_frame.evaluate("document.body.focus()")
-                await page.wait_for_timeout(500)
-                before_len = await input_frame.evaluate("document.body.innerHTML.length")
-
+                # mainFrame 에디터 영역에 이미 포커스가 있음 (body_selectors 클릭)
+                # input_buffer는 about:blank(contenteditable 아님) → 포커스 주면 안 됨
+                # page.keyboard.press() → 현재 포커스된 mainFrame 에디터로 전달
                 await page.keyboard.press("Control+v")
                 await page.wait_for_timeout(2500)
 
-                after_len = await input_frame.evaluate("document.body.innerHTML.length")
-                logger.info(f"xclip Ctrl+V: {before_len} → {after_len} (변화: {after_len - before_len})")
-
-                # SmartEditor는 paste 후 input_buffer를 정리할 수 있으므로
-                # mainFrame의 실제 내용도 확인
+                # mainFrame 텍스트 길이로 성공 여부 확인
                 main_content = await main_frame.evaluate("""
                     () => {
                         var els = document.querySelectorAll(
@@ -758,13 +747,13 @@ async def _enter_content(page, content_html):
                         return total;
                     }
                 """)
-                logger.info(f"mainFrame 텍스트 길이: {main_content}")
+                logger.info(f"xclip Ctrl+V 후 mainFrame 텍스트 길이: {main_content}")
 
-                if after_len > before_len + 50 or main_content > 100:
+                if main_content > 100:
                     logger.info("✅ 본문 입력 완료 (xclip + Ctrl+V 방식)")
                     return True
                 else:
-                    logger.warning(f"xclip Ctrl+V 후 변화 없음 → 다음 방법 시도")
+                    logger.warning(f"xclip Ctrl+V 후 mainFrame 내용 없음 ({main_content}) → 다음 방법 시도")
             except Exception as e:
                 logger.warning(f"xclip Ctrl+V 실패: {e}")
         else:
@@ -778,16 +767,10 @@ async def _enter_content(page, content_html):
         # Playwright 컨텍스트에 클립보드 권한 부여
         await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
 
-        # input_frame body 포커스 (about:blank는 locator click 불가 → JS focus)
-        await input_frame.evaluate("document.body.focus()")
-        await page.wait_for_timeout(500)
-
-        before_len = await input_frame.evaluate("document.body.innerHTML.length")
-
-        # input_frame 컨텍스트에서 클립보드에 HTML 쓰기
-        clip_result = await input_frame.evaluate("""async (html) => {
+        # mainFrame 컨텍스트에서 클립보드에 HTML 쓰기
+        # (input_frame 포커스를 주면 안 됨 - about:blank는 contenteditable 아님)
+        clip_result = await main_frame.evaluate("""async (html) => {
             try {
-                document.body.focus();
                 const htmlBlob = new Blob([html], {type: 'text/html'});
                 const textBlob = new Blob([html.replace(/<[^>]+>/g, ' ')], {type: 'text/plain'});
                 const item = new ClipboardItem({'text/html': htmlBlob, 'text/plain': textBlob});
@@ -804,18 +787,26 @@ async def _enter_content(page, content_html):
         }""", content_html)
         logger.info(f"클립보드 쓰기 결과: {clip_result}")
 
-        # Ctrl+V 전송 (JS focus 후 page.keyboard 사용)
+        # mainFrame 에디터 포커스 유지 상태에서 Ctrl+V
         await page.keyboard.press("Control+v")
         await page.wait_for_timeout(2500)
 
-        after_len = await input_frame.evaluate("document.body.innerHTML.length")
-        logger.info(f"Ctrl+V 붙여넣기: {before_len} → {after_len} bytes (변화: {after_len - before_len})")
+        main_content = await main_frame.evaluate("""
+            () => {
+                var els = document.querySelectorAll(
+                    '.se-text-paragraph, .se-component-content, .se-module-text');
+                var total = 0;
+                els.forEach(function(e) { total += e.textContent.trim().length; });
+                return total;
+            }
+        """)
+        logger.info(f"navigator.clipboard Ctrl+V 후 mainFrame 텍스트 길이: {main_content}")
 
-        if after_len > before_len + 100:
+        if main_content > 100:
             logger.info("✅ 본문 입력 완료 (navigator.clipboard + Ctrl+V 방식)")
             return True
         else:
-            logger.warning(f"clipboard+Ctrl+V 후 변화 미미 ({before_len} → {after_len}) → DataTransfer 폴백")
+            logger.warning(f"clipboard+Ctrl+V 후 mainFrame 내용 없음 ({main_content}) → DataTransfer 폴백")
     except Exception as e:
         logger.warning(f"clipboard+Ctrl+V 방식 실패: {e}")
 
