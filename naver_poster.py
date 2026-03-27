@@ -8,6 +8,7 @@ import asyncio
 import logging
 import json
 import os
+import urllib.parse
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from config import HEADLESS
@@ -357,8 +358,39 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             # [스크린샷 3] 본문 입력 후
             await _screenshot(page, "03_after_content", run_id)
 
+            # 6-0. PostSaveAjax 인터셉트: SmartEditor DOM 삽입 실패 우회
+            # SmartEditor가 발행 시 빈 contents를 서버로 보내더라도
+            # 우리가 contents 필드를 실제 HTML로 교체해서 발행
+            _inject_html = content_with_tags  # 클로저로 캡처
+
+            async def _route_inject_content(route):
+                request = route.request
+                try:
+                    raw = request.post_data or ""
+                    if raw:
+                        parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
+                        parsed["contents"] = [_inject_html]
+                        modified = urllib.parse.urlencode(
+                            {k: v[0] for k, v in parsed.items()}
+                        )
+                        logger.info(
+                            f"[Route] PostSaveAjax 가로채기 → contents {len(_inject_html):,} bytes 주입"
+                        )
+                        await route.continue_(post_data=modified)
+                    else:
+                        await route.continue_()
+                except Exception as e:
+                    logger.warning(f"[Route] 인터셉트 처리 오류: {e}")
+                    await route.continue_()
+
+            await page.route("**/PostSaveAjax.naver**", _route_inject_content)
+            logger.info("[Route] PostSaveAjax 인터셉트 등록 완료")
+
             # 6. 발행
             success = await _publish(page, run_id)
+
+            # 인터셉트 해제
+            await page.unroute("**/PostSaveAjax.naver**")
 
             # [스크린샷 6] 발행 후 최종 상태
             await _screenshot(page, "06_after_publish", run_id)
