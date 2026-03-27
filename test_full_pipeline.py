@@ -1,10 +1,13 @@
 """
-실제 블로그 포스팅 테스트
-Research → Content → Image → Structure → Naver 발행
-사용법: python test_full_pipeline.py [travel|info]
+실제 블로그 포스팅 테스트 — 오케스트레이터 기반
+당일 기사 복수 수집 → 종합 → 네이버 발행
+
+사용법:
+  python test_full_pipeline.py [travel|info|all]
+  travel : 여행/항공/호텔 블로그 3개 포스팅
+  info   : 정보/건강 블로그 3개 포스팅
+  all    : 양쪽 블로그 모두 실행 (기본값)
 """
-import asyncio
-import json
 import logging
 import sys
 import os
@@ -24,124 +27,72 @@ logging.basicConfig(
 logger = logging.getLogger("test_pipeline")
 
 from config import BLOGS, CATEGORIES
-from agents.research_agent import ResearchAgent
-from agents.content_agent import ContentAgent
-from agents.image_agent import ImageAgent
-from agents.structure_agent import StructureAgent
-from naver_poster import post_to_naver_blog
+from orchestrator import BlogOrchestrator
 
-# ── 블로그 선택 ──────────────────────────────────────────────────
-blog_key = sys.argv[1] if len(sys.argv) > 1 else "travel"
-blog_cfg = BLOGS.get(blog_key)
-if not blog_cfg:
-    print(f"❌ 알 수 없는 블로그 키: {blog_key}. 사용 가능: {list(BLOGS.keys())}")
+# ── 실행 대상 결정 ───────────────────────────────────────────────
+mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+if mode not in ("travel", "info", "all"):
+    print(f"❌ 알 수 없는 모드: {mode}. 사용 가능: travel | info | all")
     sys.exit(1)
 
-category = blog_cfg["categories"][0]
-logger.info(f"블로그: {blog_cfg['name']} / 카테고리: {category}")
+logger.info("=" * 60)
+logger.info(f"🚀 블로그 자동 포스팅 시작 (모드: {mode})")
+logger.info("=" * 60)
 
-# ── Step 1: ResearchAgent - 실제 기사 수집 ───────────────────────
-logger.info("\n" + "="*55)
-logger.info("[1/4] ResearchAgent — RSS + 웹 기사 수집")
-logger.info("="*55)
+orch = BlogOrchestrator()
 
-research = ResearchAgent()
-articles = research.get_articles(category, max_count=3)
+# 1. 오늘 포스팅 계획 수립
+plan = orch.plan_session()
 
-if articles:
-    article = articles[0]
-    logger.info(f"  수집된 기사 수: {len(articles)}")
-    logger.info(f"  선택 기사: {article.get('title', '')[:70]}")
-    logger.info(f"  출처: {article.get('source', '')} | {article.get('link', '')[:60]}")
-else:
-    logger.warning("  기사 수집 실패 → 주제 기반 생성")
-    article = {
-        "title": f"오늘의 {category} 트렌드",
-        "summary": f"{category} 분야의 최신 정보와 유용한 팁",
-        "link": "",
-        "content": ""
-    }
+# 2. 모드에 따라 필터링
+if mode != "all":
+    plan = [t for t in plan if t["blog_key"] == mode]
 
-# ── Step 2: ContentAgent - AI 콘텐츠 생성 ───────────────────────
-logger.info("\n" + "="*55)
-logger.info("[2/4] ContentAgent — AI 블로그 콘텐츠 작성")
-logger.info("="*55)
-
-content_agent = ContentAgent()
-content_data = content_agent.generate(article, category)
-
-if not content_data:
-    logger.error("❌ 콘텐츠 생성 실패")
+if not plan:
+    logger.error(f"❌ '{mode}' 에 해당하는 포스팅 계획 없음")
     sys.exit(1)
 
-title = content_data.get("title", article["title"])
-logger.info(f"  제목: {title[:70]}")
-logger.info(f"  섹션 수: {len(content_data.get('sections', []))}")
-logger.info(f"  태그(KO): {', '.join(content_data.get('tags_ko', [])[:5])}...")
+logger.info(f"📋 오늘 계획: {len(plan)}개 포스팅")
+for i, t in enumerate(plan, 1):
+    logger.info(f"  {i}. [{t['blog_key']}] {t['category']} — {t.get('topic_hint','')[:50]}")
 
-# ── Step 3: ImageAgent - 이미지 검색 ────────────────────────────
-logger.info("\n" + "="*55)
-logger.info("[3/4] ImageAgent — Unsplash/Pexels 이미지 검색")
-logger.info("="*55)
+# 3. 각 포스팅 실행 (인터벌 없이 — 테스트 모드)
+import time
+import random
 
-image_agent = ImageAgent()
-img_url, img_alt, photographer = image_agent.get_image(title, category)
+posted = 0
+failed = 0
 
-logger.info(f"  이미지: {img_url[:80]}")
-logger.info(f"  출처: {photographer}")
+for i, task in enumerate(plan, 1):
+    logger.info(f"\n{'─'*60}")
+    logger.info(f"[{i}/{len(plan)}] 포스팅 실행: {task.get('topic_hint','')[:50]}")
+    logger.info(f"{'─'*60}")
 
-# ── Step 4: StructureAgent - HTML 구성 ──────────────────────────
-logger.info("\n" + "="*55)
-logger.info("[4/4] StructureAgent — 네이버 최적화 HTML 생성")
-logger.info("="*55)
+    result = orch.run_post_pipeline(task)
 
-structure_agent = StructureAgent()
-post_data = structure_agent.format_html(
-    content_data,
-    image_url=img_url,
-    image_alt=img_alt,
-    article_link=article.get("link", ""),
-)
+    if result["success"]:
+        posted += 1
+        blog_id = BLOGS.get(task["blog_key"], {}).get("blog_id", "")
+        logger.info(f"✅ 성공: {result['title'][:55]}")
+        logger.info(f"   👉 https://blog.naver.com/{blog_id}")
+    else:
+        failed += 1
+        logger.error(f"❌ 실패: {result['title'][:55]}")
 
-if not post_data:
-    logger.error("❌ HTML 구성 실패")
-    sys.exit(1)
+    # 포스트 사이에 짧은 대기 (마지막 제외)
+    if i < len(plan):
+        wait = random.randint(30, 60)
+        logger.info(f"⏳ 다음 포스팅까지 {wait}초 대기...")
+        time.sleep(wait)
 
-final_title   = post_data.get("title") or title
-content_html  = post_data.get("content_html", "")
-tags          = post_data.get("tags", "")
-
-# 포토그래퍼 크레딧 추가
-if photographer:
-    content_html += (
-        f'\n<p style="font-size:12px;color:#aaa;text-align:right;'
-        f"font-family:'Nanum Gothic','맑은 고딕',sans-serif;margin-top:8px;\">"
-        f"{photographer}</p>"
-    )
-
-logger.info(f"  최종 제목: {final_title[:70]}")
-logger.info(f"  HTML 길이: {len(content_html):,} bytes")
-logger.info(f"  태그: {tags[:80]}")
-
-# ── Step 5: 네이버 발행 ─────────────────────────────────────────
-logger.info("\n" + "="*55)
-logger.info("[5/5] 네이버 블로그 발행")
-logger.info("="*55)
-
-async def publish():
-    result = await post_to_naver_blog(
-        final_title, content_html, tags, category, blog_cfg
-    )
-    return result
-
-success = asyncio.run(publish())
-
-logger.info("\n" + "="*55)
-if success:
-    logger.info(f"✅ 포스팅 성공!")
-    logger.info(f"   블로그: {blog_cfg['name']}")
-    logger.info(f"   제목: {final_title[:70]}")
-    logger.info(f"   URL: https://blog.naver.com/{blog_cfg['blog_id']}")
-else:
-    logger.error(f"❌ 포스팅 실패")
-logger.info("="*55)
+# 4. 결과 요약
+logger.info("\n" + "=" * 60)
+logger.info(f"🏁 완료: 성공 {posted}개 / 실패 {failed}개")
+for r in orch._results:
+    status = "✅" if r["success"] else "❌"
+    blog_id = BLOGS.get(r["blog_key"], {}).get("blog_id", "")
+    logger.info(f"  {status} [{r['blog_key']}] {r['title'][:50]}")
+    if r["success"] and blog_id:
+        logger.info(f"     → https://blog.naver.com/{blog_id}")
+logger.info("=" * 60)
