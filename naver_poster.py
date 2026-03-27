@@ -485,171 +485,206 @@ async def _enter_title(page, title):
 async def _enter_content(page, content_html):
     """본문 입력 - SmartEditor ONE
 
-    핵심: Playwright evaluate() 인자 전달로 HTML 안전하게 전달.
-    JS 템플릿 리터럴 직접 삽입 방식은 대용량 HTML에서 깨짐 → 인자 방식 사용.
+    전략: SmartEditor 소스코드 버튼 클릭 → textarea에 HTML 직접 입력 (대용량 HTML 안전)
+    insertHTML은 SmartEditor에서 대용량 HTML 삽입 시 무음 실패하므로 사용하지 않음.
     """
-    # safe_html은 더 이상 JS 인라인 삽입에 쓰지 않고 인자로 전달
-    safe_html = content_html  # Playwright evaluate(fn, arg)가 JSON 직렬화로 안전하게 전달
-
     main_frame = page.frame(name="mainFrame")
     if not main_frame:
         logger.warning("본문 입력 실패: mainFrame 없음")
         return
 
-    # ── mainFrame 구조 진단 ─────────────────────────────────────────
-    try:
-        mf_debug = await main_frame.evaluate("""
-            () => {
-                var ces = Array.from(document.querySelectorAll('[contenteditable]'));
-                var placeholders = Array.from(document.querySelectorAll('[class*="placeholder"]'));
-                var components = Array.from(document.querySelectorAll('.se-component, .se-section'));
-                return {
-                    contentEditables: ces.map(e => e.tagName + '.' + (e.className||'').substring(0,30)).join('|'),
-                    placeholders: placeholders.map(e => e.tagName + '.' + (e.className||'').substring(0,30)).join('|'),
-                    components: components.slice(0,5).map(e => e.tagName + '.' + (e.className||'').substring(0,30)).join('|')
-                };
-            }
-        """)
-        logger.info(f"mainFrame 구조: CE={mf_debug['contentEditables'][:100]}")
-        logger.info(f"  placeholders: {mf_debug['placeholders'][:100]}")
-        logger.info(f"  components:   {mf_debug['components'][:100]}")
-    except Exception as e:
-        logger.debug(f"mainFrame 진단 실패: {e}")
+    # ── 방법 1: SmartEditor 소스코드 버튼 ─────────────────────────
+    # 소스코드 버튼 → HTML textarea → 확인 버튼 → 본문 HTML 직접 삽입
+    logger.info("소스코드 버튼 방식으로 본문 삽입 시도")
 
-    # ── 방법 1: mainFrame의 본문 영역 직접 Playwright click() ───────
-    # SmartEditor ONE: 클릭해야 input_buffer에 커서가 본문 위치로 이동
-    body_selectors = [
-        'p.se-placeholder',
-        '.se-placeholder',
-        '.se-component-content .se-text',
-        '.se-section-body .se-component .se-component-content',
-        '.se-main-section',
-        '.se-component:not(.se-component-title)',
+    source_btn_selectors = [
+        "button[data-type='source']",
+        "button.se-toolbar-icon-source",
+        "button:has-text('소스코드')",
+        "button[title='소스코드']",
+        "button[aria-label='소스코드']",
+        ".se-toolbar button[class*='source']",
     ]
 
-    clicked_body = False
-    for sel in body_selectors:
+    source_btn_clicked = False
+    for sel in source_btn_selectors:
         try:
             loc = main_frame.locator(sel).first
             cnt = await loc.count()
             if cnt == 0:
                 continue
             await loc.click(force=True)
-            await page.wait_for_timeout(800)
-            logger.info(f"본문 영역 클릭 성공: {sel} (count={cnt})")
-            clicked_body = True
+            await page.wait_for_timeout(1000)
+            logger.info(f"소스코드 버튼 클릭: {sel}")
+            source_btn_clicked = True
             break
         except Exception as e:
-            logger.debug(f"본문 selector 클릭 실패 ({sel}): {e}")
+            logger.debug(f"소스코드 버튼 시도 실패 ({sel}): {e}")
 
-    if not clicked_body:
-        logger.info("본문 selector 클릭 실패 → Tab 폴백")
-        await page.keyboard.press("Tab")
-        await page.wait_for_timeout(800)
+    # 버튼을 못 찾으면 JS로 클릭 시도
+    if not source_btn_clicked:
+        logger.info("소스코드 버튼 JS 탐색 시도")
+        try:
+            js_clicked = await main_frame.evaluate("""
+                () => {
+                    var buttons = Array.from(document.querySelectorAll('button'));
+                    var btn = buttons.find(b =>
+                        b.textContent.includes('소스') ||
+                        b.getAttribute('data-type') === 'source' ||
+                        (b.className && b.className.includes('source'))
+                    );
+                    if (btn) { btn.click(); return btn.outerHTML.substring(0,100); }
+                    // SmartEditor toolbar title 탐색
+                    var toolbarItems = Array.from(document.querySelectorAll('[class*="toolbar"] button, [class*="tool"] button'));
+                    var found = toolbarItems.find(b => b.title && b.title.includes('소스'));
+                    if (found) { found.click(); return 'found:' + found.title; }
+                    return 'not_found';
+                }
+            """)
+            logger.info(f"JS 소스코드 버튼 탐색: {js_clicked}")
+            if js_clicked != 'not_found':
+                source_btn_clicked = True
+                await page.wait_for_timeout(1000)
+        except Exception as e:
+            logger.debug(f"JS 소스코드 버튼 탐색 실패: {e}")
 
-    # ── input_buffer 대기 (클릭 후 SmartEditor가 준비될 때까지) ────
+    if source_btn_clicked:
+        # 소스코드 textarea 대기
+        textarea = None
+        textarea_selectors = [
+            "textarea.se-textarea",
+            "textarea[class*='source']",
+            ".se-source-editor textarea",
+            "textarea",
+        ]
+        for sel in textarea_selectors:
+            try:
+                loc = main_frame.locator(sel).first
+                cnt = await loc.count()
+                if cnt > 0:
+                    textarea = loc
+                    logger.info(f"소스코드 textarea 발견: {sel}")
+                    break
+            except Exception as e:
+                logger.debug(f"textarea 탐색 실패 ({sel}): {e}")
+
+        # mainFrame 외부 (오버레이 다이얼로그) 도 탐색
+        if not textarea:
+            try:
+                # page level에서 탐색
+                loc = page.locator("textarea").first
+                cnt = await loc.count()
+                if cnt > 0:
+                    textarea = loc
+                    logger.info("소스코드 textarea 발견: page-level")
+            except Exception as e:
+                logger.debug(f"page-level textarea 탐색 실패: {e}")
+
+        if textarea:
+            try:
+                await textarea.click()
+                await page.wait_for_timeout(300)
+                # Ctrl+A 로 기존 내용 선택 후 덮어쓰기
+                await textarea.press("Control+a")
+                await page.wait_for_timeout(200)
+                await textarea.fill(content_html)
+                await page.wait_for_timeout(500)
+                logger.info(f"소스코드 textarea에 HTML 입력 완료 ({len(content_html):,} bytes)")
+
+                # 확인 버튼 클릭
+                confirm_selectors = [
+                    "button:has-text('확인')",
+                    "button[class*='confirm']",
+                    "button[class*='ok']",
+                    ".se-source-editor button",
+                ]
+                confirmed = False
+                for csel in confirm_selectors:
+                    try:
+                        cloc = main_frame.locator(csel).first
+                        ccnt = await cloc.count()
+                        if ccnt > 0:
+                            await cloc.click(force=True)
+                            logger.info(f"확인 버튼 클릭: {csel}")
+                            confirmed = True
+                            break
+                    except Exception:
+                        pass
+                if not confirmed:
+                    # page-level 확인 버튼
+                    try:
+                        cloc = page.locator("button:has-text('확인')").first
+                        ccnt = await cloc.count()
+                        if ccnt > 0:
+                            await cloc.click()
+                            logger.info("확인 버튼 클릭: page-level")
+                            confirmed = True
+                    except Exception:
+                        pass
+                if not confirmed:
+                    # Enter 키로 확인
+                    await page.keyboard.press("Enter")
+                    logger.info("확인 버튼 없음 → Enter 키로 대체")
+
+                await page.wait_for_timeout(1500)
+                logger.info("본문 입력 완료 (소스코드 버튼 방식)")
+                return
+            except Exception as e:
+                logger.warning(f"소스코드 textarea 입력 실패: {e}")
+        else:
+            logger.warning("소스코드 textarea 발견 실패")
+
+    # ── 방법 2: input_buffer에 직접 DOM 조작 (폴백) ────────────────
+    logger.info("폴백: input_buffer DOM 직접 조작")
+
+    body_selectors = [
+        'p.se-placeholder',
+        '.se-placeholder',
+        '.se-main-section',
+        '.se-component:not(.se-component-title)',
+    ]
+    for sel in body_selectors:
+        try:
+            loc = main_frame.locator(sel).first
+            if await loc.count() > 0:
+                await loc.click(force=True)
+                await page.wait_for_timeout(800)
+                break
+        except Exception:
+            pass
+
     input_frame = None
     for wait_i in range(12):
         input_frame = next((f for f in page.frames if f.name.startswith("input_buffer")), None)
         if input_frame:
             break
         await page.wait_for_timeout(500)
-        logger.debug(f"input_buffer 대기 중... {wait_i + 1}/12")
     if not input_frame:
-        logger.warning("input_buffer 프레임 없음 (6초 대기 후에도)")
+        logger.warning("input_buffer 프레임 없음")
         return
 
-    logger.info(f"본문 삽입 프레임: {input_frame.name}")
-
+    logger.info(f"폴백 프레임: {input_frame.name}")
     try:
-        # 삽입 전 상태 진단
-        diag = await input_frame.evaluate("""
-            () => {
-                var sel = window.getSelection();
-                var selInfo = 'no_selection';
-                if (sel && sel.rangeCount > 0) {
-                    var range = sel.getRangeAt(0);
-                    var node = range.startContainer;
-                    selInfo = (node.nodeType === 3 ? 'text:' + node.textContent.substring(0,20)
-                               : (node.className || node.tagName || 'unknown'))
-                              + '@' + range.startOffset;
-                }
-                return {
-                    hasFocus: document.hasFocus(),
-                    bodyLen: document.body.innerHTML.length,
-                    bodyPreview: document.body.innerHTML.substring(0, 120),
-                    children: Array.from(document.body.children).map(
-                        e => e.tagName + '.' + (e.className||'').substring(0,20)
-                    ).join('|'),
-                    sel: selInfo
-                };
-            }
-        """)
-        logger.info(f"input_buffer 진단: focus={diag['hasFocus']}, bodyLen={diag['bodyLen']}, sel={diag['sel']}")
-        logger.info(f"  body children: {diag['children']}")
-        logger.info(f"  body preview:  {diag['bodyPreview'][:80]}")
+        before_len = await input_frame.evaluate("document.body.innerHTML.length")
 
-        before_len = diag['bodyLen']
-
-        # ── 1차: insertHTML (Playwright 인자 전달 - JS 인라인 삽입 X) ──
-        ok1 = await input_frame.evaluate(
-            "(html) => document.execCommand('insertHTML', false, html)",
-            safe_html
-        )
-        after_len1 = await input_frame.evaluate("document.body.innerHTML.length")
-        logger.info(f"1차 insertHTML: ok={ok1}, 길이 {before_len} → {after_len1}")
-
-        if after_len1 > before_len + 10:
-            logger.info("본문 입력 완료 (1차: insertHTML)")
-            return
-
-        # ── 2차: 커서 이동 후 insertHTML ────────────────────────────
-        logger.warning("1차 삽입 변화 미미 → 2차: 커서 이동 후 삽입")
-        result2 = await input_frame.evaluate("""
+        # DOM 직접 삽입 + 이벤트 발생
+        result = await input_frame.evaluate("""
             (html) => {
                 var body = document.body;
-                var children = Array.from(body.children);
-                if (children.length === 0) return 'no_children';
-                var targetEl = children.length > 1 ? children[1] : children[0];
-                var sel = window.getSelection();
-                var range = document.createRange();
-                range.selectNodeContents(targetEl);
-                range.collapse(true);
-                sel.removeAllRanges();
-                sel.addRange(range);
-                var ok2 = document.execCommand('insertHTML', false, html);
-                return 'ok=' + ok2 + ':len=' + body.innerHTML.length;
-            }
-        """, safe_html)
-        after_len2 = await input_frame.evaluate("document.body.innerHTML.length")
-        logger.info(f"2차 삽입: {result2}, 길이 {after_len2}")
-
-        if after_len2 > before_len + 10:
-            logger.info("본문 입력 완료 (2차: cursor-moved insertHTML)")
-            return
-
-        # ── 3차: DOM 직접 삽입 (최후 수단) ─────────────────────────
-        logger.warning("3차: DOM 직접 조작")
-        result3 = await input_frame.evaluate("""
-            (html) => {
-                var body = document.body;
-                var children = Array.from(body.children);
                 var div = document.createElement('div');
                 div.innerHTML = html;
+                // 기존 placeholder p 뒤에 삽입
+                var children = Array.from(body.children);
                 var refNode = children.length > 1 ? children[1] : null;
-                if (refNode) {
-                    body.insertBefore(div, refNode);
-                } else {
-                    body.appendChild(div);
-                }
+                if (refNode) body.insertBefore(div, refNode);
+                else body.appendChild(div);
                 body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}));
                 return 'dom:len=' + body.innerHTML.length;
             }
-        """, safe_html)
-        logger.info(f"3차 DOM 삽입: {result3}")
-
+        """, content_html)
+        logger.info(f"폴백 DOM 삽입: {result} (before={before_len})")
     except Exception as e:
-        logger.error(f"본문 입력 실패: {e}", exc_info=True)
+        logger.error(f"폴백 DOM 삽입 실패: {e}", exc_info=True)
 
 
 async def _enter_tags(page, tags):
