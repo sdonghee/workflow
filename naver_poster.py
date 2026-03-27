@@ -352,118 +352,132 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
                 content_with_tags = content_html + f"<p>{tag_line}</p>"
             else:
                 content_with_tags = content_html
-            await _enter_content(page, content_with_tags)
+
+            logger.info(f"본문 내용 확인 (앞 300자): {content_with_tags[:300]}")
+            logger.info(f"본문 총 길이: {len(content_with_tags):,} bytes")
+
+            content_inserted = await _enter_content(page, content_with_tags)
             await page.wait_for_timeout(1500)
 
-            # [스크린샷 3] 본문 입력 후 (참고용)
+            # [스크린샷 3] 본문 입력 후
             await _screenshot(page, "03_after_content", run_id)
 
-            # 6. 브라우저 fetch()로 PostSaveAjax 직접 호출 (SmartEditor 완전 우회)
-            # SmartEditor DOM 조작 / route 인터셉트 모두 불필요
-            # 브라우저 세션(쿠키)을 그대로 사용하므로 인증 문제 없음
-            tag_list_str = tags
-            blog_id_str = blog_config["blog_id"]
-
-            # blogNo 추출 (mainFrame JS 컨텍스트에서)
-            blog_no = ""
-            if main_frame:
-                try:
-                    blog_no = await main_frame.evaluate("""
-                        () => {
-                            if (window.__blogNo) return String(window.__blogNo);
-                            // nts_blog 객체
-                            if (window.nts_blog && window.nts_blog.blogNo)
-                                return String(window.nts_blog.blogNo);
-                            // 스크립트 태그 파싱
-                            for (var s of Array.from(document.scripts)) {
-                                var m = s.text.match(/"blogNo"\s*:\s*"?(\d+)"?/);
-                                if (m) return m[1];
-                                var m2 = s.text.match(/blogNo\s*=\s*['"]?(\d+)['"]?/);
-                                if (m2) return m2[1];
-                            }
-                            return '';
-                        }
-                    """)
-                    logger.info(f"[BrowserFetch] blogNo 추출: '{blog_no}'")
-                except Exception as e:
-                    logger.warning(f"[BrowserFetch] blogNo 추출 실패: {e}")
-
-            logger.info(f"[BrowserFetch] PostSaveAjax 직접 호출 시작 "
-                       f"(title={title[:30]}, contents={len(content_with_tags):,}bytes)")
-
-            fetch_result = await page.evaluate("""
-                async ({title, contents, blogId, blogNo, tags}) => {
-                    try {
-                        const params = new URLSearchParams();
-                        params.append('blogId',              blogId);
-                        params.append('blogNo',              blogNo);
-                        params.append('logNo',               '0');
-                        params.append('title',               title);
-                        params.append('contents',            contents);
-                        params.append('categoryNo',          '0');
-                        params.append('tag',                 tags);
-                        params.append('type',                'post');
-                        params.append('status',              'publish');
-                        params.append('useRssYN',            'Y');
-                        params.append('allowComment',        'true');
-                        params.append('allowLike',           'true');
-                        params.append('allowExternalSearch', 'true');
-                        params.append('addCategoryYN',       'N');
-                        params.append('addContents',         '');
-                        params.append('publishDate',         '');
-                        params.append('publishTime',         '');
-                        params.append('cclUploadLicense',    '');
-                        params.append('cclCommercial',       '');
-                        params.append('cclModification',     '');
-
-                        const resp = await fetch('https://blog.naver.com/PostSaveAjax.naver', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                                'X-Requested-With': 'XMLHttpRequest',
-                            },
-                            credentials: 'include',
-                            body: params.toString(),
-                        });
-                        const text = await resp.text();
-                        return {ok: resp.ok, status: resp.status, text: text.substring(0, 1000)};
-                    } catch(e) {
-                        return {ok: false, status: 0, text: 'fetch_error: ' + e.message};
-                    }
-                }
-            """, {
-                "title":    title,
-                "contents": content_with_tags,
-                "blogId":   blog_id_str,
-                "blogNo":   blog_no,
-                "tags":     tag_list_str,
-            })
-
-            logger.info(f"[BrowserFetch] 응답: status={fetch_result['status']}, "
-                       f"text={fetch_result['text'][:300]}")
-
-            fetch_text = fetch_result.get("text", "")
-            fetch_ok   = fetch_result.get("ok", False)
-
-            # 성공 판단: logNo 또는 SUCCESS 포함
+            success = False
             import re as _re
-            log_no_match = _re.search(r'"logNo"\s*:\s*"?(\d+)"?', fetch_text)
-            success = (
-                log_no_match is not None or
-                "SUCCESS" in fetch_text.upper() or
-                (fetch_ok and "error" not in fetch_text.lower() and fetch_result['status'] == 200)
-            )
 
-            if log_no_match:
-                log_no = log_no_match.group(1)
-                logger.info(f"[BrowserFetch] ✅ 발행 성공! logNo={log_no} "
-                           f"→ https://blog.naver.com/{blog_id_str}/{log_no}")
-            elif success:
-                logger.info("[BrowserFetch] ✅ 발행 성공 (200 OK)")
+            if content_inserted:
+                # ── 경로 A: SmartEditor에 삽입 성공 → 발행 버튼 클릭 ──────
+                # 사용자가 수동으로 붙여넣기 후 발행하는 것과 동일한 경로
+                logger.info("✅ SmartEditor 삽입 성공 → 발행 버튼 클릭")
+                await _publish(page, run_id)
+                await page.wait_for_timeout(3000)
+                await _screenshot(page, "04_after_publish", run_id)
+                success = True
             else:
-                logger.error(f"[BrowserFetch] ❌ 발행 실패: {fetch_text[:200]}")
+                # ── 경로 B: SmartEditor 삽입 실패 → PostSaveAjax 직접 호출 ──
+                logger.warning("SmartEditor 삽입 실패 → PostSaveAjax API 직접 호출 (폴백)")
+                tag_list_str = tags
+                blog_id_str = blog_config["blog_id"]
 
-            # [스크린샷 6] 발행 후 최종 상태
+                # blogNo 추출 (mainFrame JS 컨텍스트에서)
+                blog_no = ""
+                if main_frame:
+                    try:
+                        blog_no = await main_frame.evaluate("""
+                            () => {
+                                if (window.__blogNo) return String(window.__blogNo);
+                                if (window.nts_blog && window.nts_blog.blogNo)
+                                    return String(window.nts_blog.blogNo);
+                                for (var s of Array.from(document.scripts)) {
+                                    var m = s.text.match(/"blogNo"\s*:\s*"?(\d+)"?/);
+                                    if (m) return m[1];
+                                    var m2 = s.text.match(/blogNo\s*=\s*['"]?(\d+)['"]?/);
+                                    if (m2) return m2[1];
+                                }
+                                return '';
+                            }
+                        """)
+                        logger.info(f"[PostSaveAjax] blogNo: '{blog_no}'")
+                    except Exception as e:
+                        logger.warning(f"[PostSaveAjax] blogNo 추출 실패: {e}")
+
+                logger.info(f"[PostSaveAjax] 호출 시작 (title={title[:30]}, "
+                           f"contents={len(content_with_tags):,}bytes)")
+
+                fetch_result = await page.evaluate("""
+                    async ({title, contents, blogId, blogNo, tags, referer}) => {
+                        try {
+                            const params = new URLSearchParams();
+                            params.append('blogId',              blogId);
+                            params.append('blogNo',              blogNo);
+                            params.append('logNo',               '0');
+                            params.append('title',               title);
+                            params.append('contents',            contents);
+                            params.append('categoryNo',          '0');
+                            params.append('tag',                 tags);
+                            params.append('type',                'post');
+                            params.append('status',              'publish');
+                            params.append('useRssYN',            'Y');
+                            params.append('allowComment',        'true');
+                            params.append('allowLike',           'true');
+                            params.append('allowExternalSearch', 'true');
+                            params.append('addCategoryYN',       'N');
+                            params.append('addContents',         '');
+                            params.append('publishDate',         '');
+                            params.append('publishTime',         '');
+                            params.append('cclUploadLicense',    '');
+                            params.append('cclCommercial',       '');
+                            params.append('cclModification',     '');
+
+                            const resp = await fetch('https://blog.naver.com/PostSaveAjax.naver', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/x-www-form-urlencoded',
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                    'Referer': referer || window.location.href,
+                                    'Origin': 'https://blog.naver.com',
+                                },
+                                credentials: 'include',
+                                body: params.toString(),
+                            });
+                            const text = await resp.text();
+                            return {ok: resp.ok, status: resp.status, text: text.substring(0, 2000)};
+                        } catch(e) {
+                            return {ok: false, status: 0, text: 'fetch_error: ' + e.message};
+                        }
+                    }
+                """, {
+                    "title":    title,
+                    "contents": content_with_tags,
+                    "blogId":   blog_id_str,
+                    "blogNo":   blog_no,
+                    "tags":     tag_list_str,
+                    "referer":  page.url,
+                })
+
+                logger.info(f"[PostSaveAjax] 응답: status={fetch_result['status']}, "
+                           f"text={fetch_result['text'][:500]}")
+
+                fetch_text = fetch_result.get("text", "")
+                fetch_ok   = fetch_result.get("ok", False)
+
+                log_no_match = _re.search(r'"logNo"\s*:\s*"?(\d+)"?', fetch_text)
+                success = (
+                    log_no_match is not None or
+                    "SUCCESS" in fetch_text.upper() or
+                    (fetch_ok and "error" not in fetch_text.lower() and fetch_result['status'] == 200)
+                )
+
+                if log_no_match:
+                    log_no = log_no_match.group(1)
+                    logger.info(f"[PostSaveAjax] ✅ 발행 성공! logNo={log_no} "
+                               f"→ https://blog.naver.com/{blog_id_str}/{log_no}")
+                elif success:
+                    logger.info("[PostSaveAjax] ✅ 발행 성공 (200 OK)")
+                else:
+                    logger.error(f"[PostSaveAjax] ❌ 발행 실패: {fetch_text[:300]}")
+
+            # [스크린샷] 발행 후 최종 상태
             await _screenshot(page, "06_after_publish", run_id)
 
             if success:
@@ -588,16 +602,17 @@ async def _enter_title(page, title):
 async def _enter_content(page, content_html):
     """본문 입력 - SmartEditor ONE
 
-    전략: DataTransfer + ClipboardEvent paste 이벤트 dispatch
-    - 사용자가 수동으로 복사-붙여넣기 하면 SmartEditor가 HTML을 수락함
-    - 이를 자동화: DataTransfer에 text/html 설정 → paste 이벤트 dispatch
-    - SmartEditor ONE은 소스코드 버튼 없음 (2022년 이후 제거)
-    - execCommand('insertHTML')은 대용량 HTML에서 무음 실패
+    전략 (우선순위):
+    1. navigator.clipboard.write() + Ctrl+V  ← 사용자 수동 복붙과 동일, SmartEditor가 정상 처리
+    2. DataTransfer + ClipboardEvent paste   ← 폴백 (일부 환경에서 동작)
+    3. DOM 직접 삽입                         ← 최후 폴백 (SmartEditor 인식 불확실)
+
+    반환값: True = 내용 삽입 성공, False = 실패 (PostSaveAjax 폴백 필요)
     """
     main_frame = page.frame(name="mainFrame")
     if not main_frame:
         logger.warning("본문 입력 실패: mainFrame 없음")
-        return
+        return False
 
     # ── 본문 영역 클릭하여 포커스 ─────────────────────────────────
     body_selectors = [
@@ -626,246 +641,126 @@ async def _enter_content(page, content_html):
         await page.wait_for_timeout(500)
     if not input_frame:
         logger.warning("input_buffer 프레임 없음")
-        return
+        return False
     logger.info(f"input_buffer 프레임: {input_frame.name}")
 
-    # ── 방법 1: DataTransfer + ClipboardEvent paste (메인 방식) ───
-    # 사용자가 외부 앱에서 복사-붙여넣기 하면 됨 → 이것을 자동화
-    logger.info(f"DataTransfer paste 이벤트 방식 시도 (HTML {len(content_html):,} bytes)")
+    # ── 방법 1: navigator.clipboard.write() + Ctrl+V (메인 방식) ─────
+    # 사용자가 수동으로 복사-붙여넣기 할 때와 완전히 동일한 경로
+    # SmartEditor가 실제 paste 이벤트로 처리 → 내부 JSON 포맷 변환
+    logger.info(f"navigator.clipboard + Ctrl+V 방식 시도 (HTML {len(content_html):,} bytes)")
     try:
-        # 포커스 설정
+        # Playwright 컨텍스트에 클립보드 권한 부여
+        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+
+        # input_frame body 포커스 (클립보드 쓰기 전 문서 포커스 필요)
         await input_frame.locator("body").click()
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(500)
 
         before_len = await input_frame.evaluate("document.body.innerHTML.length")
 
-        # DataTransfer에 text/html 설정 후 paste 이벤트 dispatch
+        # input_frame 컨텍스트에서 클립보드에 HTML 쓰기
+        clip_result = await input_frame.evaluate("""async (html) => {
+            try {
+                document.body.focus();
+                const htmlBlob = new Blob([html], {type: 'text/html'});
+                const textBlob = new Blob([html.replace(/<[^>]+>/g, ' ')], {type: 'text/plain'});
+                const item = new ClipboardItem({'text/html': htmlBlob, 'text/plain': textBlob});
+                await navigator.clipboard.write([item]);
+                return 'html_clipboard_ok';
+            } catch(e1) {
+                try {
+                    await navigator.clipboard.writeText(html);
+                    return 'text_clipboard_ok';
+                } catch(e2) {
+                    return 'error: ' + e1.message + ' | ' + e2.message;
+                }
+            }
+        }""", content_html)
+        logger.info(f"클립보드 쓰기 결과: {clip_result}")
+
+        # input_frame body에 Ctrl+V 직접 전송 (실제 사용자 붙여넣기와 동일)
+        await input_frame.locator("body").press("Control+v")
+        await page.wait_for_timeout(2500)
+
+        after_len = await input_frame.evaluate("document.body.innerHTML.length")
+        logger.info(f"Ctrl+V 붙여넣기: {before_len} → {after_len} bytes (변화: {after_len - before_len})")
+
+        if after_len > before_len + 100:
+            logger.info("✅ 본문 입력 완료 (navigator.clipboard + Ctrl+V 방식)")
+            return True
+        else:
+            logger.warning(f"clipboard+Ctrl+V 후 변화 미미 ({before_len} → {after_len}) → DataTransfer 폴백")
+    except Exception as e:
+        logger.warning(f"clipboard+Ctrl+V 방식 실패: {e}")
+
+    # ── 방법 2: DataTransfer + ClipboardEvent paste (폴백) ──────────
+    logger.info("DataTransfer paste 폴백 시도")
+    try:
+        await input_frame.locator("body").click()
+        await page.wait_for_timeout(300)
+        before_len = await input_frame.evaluate("document.body.innerHTML.length")
+
         paste_result = await input_frame.evaluate("""
             (html) => {
                 try {
                     var body = document.body;
                     body.focus();
-
-                    // 커서를 본문 끝으로 이동
                     var sel = window.getSelection();
                     var range = document.createRange();
                     range.selectNodeContents(body);
                     range.collapse(false);
                     sel.removeAllRanges();
                     sel.addRange(range);
-
-                    // DataTransfer에 HTML 설정
                     var dt = new DataTransfer();
                     dt.setData('text/html', html);
                     dt.setData('text/plain', body.innerText || '');
-
-                    // paste 이벤트 dispatch
                     var pasteEvent = new ClipboardEvent('paste', {
-                        clipboardData: dt,
-                        bubbles: true,
-                        cancelable: true
+                        clipboardData: dt, bubbles: true, cancelable: true
                     });
                     body.dispatchEvent(pasteEvent);
-
-                    return 'paste_dispatched:len=' + body.innerHTML.length;
-                } catch(e) {
-                    return 'error:' + e.message;
-                }
+                    return 'dispatched:' + body.innerHTML.length;
+                } catch(e) { return 'error:' + e.message; }
             }
         """, content_html)
-
         await page.wait_for_timeout(1500)
         after_len = await input_frame.evaluate("document.body.innerHTML.length")
-        logger.info(f"DataTransfer paste: {paste_result} → 길이 {before_len} → {after_len}")
-
-        if after_len > before_len + 50:
-            logger.info("본문 입력 완료 (DataTransfer paste 방식)")
-            return
+        logger.info(f"DataTransfer paste: {paste_result} → {before_len} → {after_len}")
+        if after_len > before_len + 100:
+            logger.info("✅ 본문 입력 완료 (DataTransfer 방식)")
+            return True
         else:
             logger.warning(f"DataTransfer paste 후 변화 미미 ({before_len} → {after_len})")
     except Exception as e:
         logger.warning(f"DataTransfer paste 실패: {e}")
 
-    # ── 방법 2: 소스코드 버튼 탐색 (혹시 있을 경우) ─────────────
-    logger.info("소스코드 버튼 방식으로 본문 삽입 시도")
-
-    source_btn_selectors = [
-        "button[data-type='source']",
-        "button.se-toolbar-icon-source",
-        "button:has-text('소스코드')",
-        "button[title='소스코드']",
-        "button[aria-label='소스코드']",
-        ".se-toolbar button[class*='source']",
-    ]
-
-    source_btn_clicked = False
-    for sel in source_btn_selectors:
-        try:
-            loc = main_frame.locator(sel).first
-            cnt = await loc.count()
-            if cnt == 0:
-                continue
-            await loc.click(force=True)
-            await page.wait_for_timeout(1000)
-            logger.info(f"소스코드 버튼 클릭: {sel}")
-            source_btn_clicked = True
-            break
-        except Exception as e:
-            logger.debug(f"소스코드 버튼 시도 실패 ({sel}): {e}")
-
-    # 버튼을 못 찾으면 JS로 클릭 시도
-    if not source_btn_clicked:
-        logger.info("소스코드 버튼 JS 탐색 시도")
-        try:
-            js_clicked = await main_frame.evaluate("""
-                () => {
-                    var buttons = Array.from(document.querySelectorAll('button'));
-                    var btn = buttons.find(b =>
-                        b.textContent.includes('소스') ||
-                        b.getAttribute('data-type') === 'source' ||
-                        (b.className && b.className.includes('source'))
-                    );
-                    if (btn) { btn.click(); return btn.outerHTML.substring(0,100); }
-                    // SmartEditor toolbar title 탐색
-                    var toolbarItems = Array.from(document.querySelectorAll('[class*="toolbar"] button, [class*="tool"] button'));
-                    var found = toolbarItems.find(b => b.title && b.title.includes('소스'));
-                    if (found) { found.click(); return 'found:' + found.title; }
-                    return 'not_found';
-                }
-            """)
-            logger.info(f"JS 소스코드 버튼 탐색: {js_clicked}")
-            if js_clicked != 'not_found':
-                source_btn_clicked = True
-                await page.wait_for_timeout(1000)
-        except Exception as e:
-            logger.debug(f"JS 소스코드 버튼 탐색 실패: {e}")
-
-    if source_btn_clicked:
-        # 소스코드 textarea 대기
-        textarea = None
-        textarea_selectors = [
-            "textarea.se-textarea",
-            "textarea[class*='source']",
-            ".se-source-editor textarea",
-            "textarea",
-        ]
-        for sel in textarea_selectors:
-            try:
-                loc = main_frame.locator(sel).first
-                cnt = await loc.count()
-                if cnt > 0:
-                    textarea = loc
-                    logger.info(f"소스코드 textarea 발견: {sel}")
-                    break
-            except Exception as e:
-                logger.debug(f"textarea 탐색 실패 ({sel}): {e}")
-
-        # mainFrame 외부 (오버레이 다이얼로그) 도 탐색
-        if not textarea:
-            try:
-                # page level에서 탐색
-                loc = page.locator("textarea").first
-                cnt = await loc.count()
-                if cnt > 0:
-                    textarea = loc
-                    logger.info("소스코드 textarea 발견: page-level")
-            except Exception as e:
-                logger.debug(f"page-level textarea 탐색 실패: {e}")
-
-        if textarea:
-            try:
-                await textarea.click()
-                await page.wait_for_timeout(300)
-                # Ctrl+A 로 기존 내용 선택 후 덮어쓰기
-                await textarea.press("Control+a")
-                await page.wait_for_timeout(200)
-                await textarea.fill(content_html)
-                await page.wait_for_timeout(500)
-                logger.info(f"소스코드 textarea에 HTML 입력 완료 ({len(content_html):,} bytes)")
-
-                # 확인 버튼 클릭
-                confirm_selectors = [
-                    "button:has-text('확인')",
-                    "button[class*='confirm']",
-                    "button[class*='ok']",
-                    ".se-source-editor button",
-                ]
-                confirmed = False
-                for csel in confirm_selectors:
-                    try:
-                        cloc = main_frame.locator(csel).first
-                        ccnt = await cloc.count()
-                        if ccnt > 0:
-                            await cloc.click(force=True)
-                            logger.info(f"확인 버튼 클릭: {csel}")
-                            confirmed = True
-                            break
-                    except Exception:
-                        pass
-                if not confirmed:
-                    # page-level 확인 버튼
-                    try:
-                        cloc = page.locator("button:has-text('확인')").first
-                        ccnt = await cloc.count()
-                        if ccnt > 0:
-                            await cloc.click()
-                            logger.info("확인 버튼 클릭: page-level")
-                            confirmed = True
-                    except Exception:
-                        pass
-                if not confirmed:
-                    # Enter 키로 확인
-                    await page.keyboard.press("Enter")
-                    logger.info("확인 버튼 없음 → Enter 키로 대체")
-
-                await page.wait_for_timeout(1500)
-                logger.info("본문 입력 완료 (소스코드 버튼 방식)")
-                return
-            except Exception as e:
-                logger.warning(f"소스코드 textarea 입력 실패: {e}")
-        else:
-            logger.warning("소스코드 textarea 발견 실패")
-
-    # ── 방법 3: input_buffer DOM 직접 조작 + 다중 이벤트 (최후 폴백) ──
-    logger.info("최후 폴백: input_buffer DOM 직접 조작")
+    # ── 방법 3: DOM 직접 삽입 (최후 폴백, SmartEditor 인식 불확실) ──
+    logger.warning("최후 폴백: DOM 직접 삽입")
     try:
         before_len = await input_frame.evaluate("document.body.innerHTML.length")
-
         result = await input_frame.evaluate("""
             (html) => {
                 var body = document.body;
                 body.focus();
-
-                // paste 이벤트로 먼저 시도
-                try {
-                    var dt2 = new DataTransfer();
-                    dt2.setData('text/html', html);
-                    var pe2 = new ClipboardEvent('paste', {clipboardData: dt2, bubbles: true, cancelable: true});
-                    body.dispatchEvent(pe2);
-                } catch(e2) {}
-
-                // DOM 직접 삽입
                 var div = document.createElement('div');
                 div.innerHTML = html;
                 var children = Array.from(body.children);
                 var refNode = children.length > 1 ? children[1] : null;
                 if (refNode) body.insertBefore(div, refNode);
                 else body.appendChild(div);
-
-                // 여러 이벤트 발생시켜 SmartEditor에 변경 알림
-                ['input', 'keyup', 'change'].forEach(function(evtName) {
-                    try {
-                        body.dispatchEvent(new Event(evtName, {bubbles: true}));
-                    } catch(e) {}
+                ['input', 'keyup', 'change'].forEach(function(n) {
+                    try { body.dispatchEvent(new Event(n, {bubbles:true})); } catch(e){}
                 });
-
-                return 'dom_fallback:len=' + body.innerHTML.length;
+                return 'dom:' + body.innerHTML.length;
             }
         """, content_html)
         after_len = await input_frame.evaluate("document.body.innerHTML.length")
-        logger.info(f"최후 폴백 DOM 삽입: {result}, 길이 {before_len} → {after_len}")
+        logger.info(f"DOM 직접 삽입: {result} ({before_len} → {after_len})")
+        if after_len > before_len + 100:
+            logger.info("DOM 삽입됨 (SmartEditor 인식 여부 불확실)")
     except Exception as e:
-        logger.error(f"최후 폴백 실패: {e}", exc_info=True)
+        logger.error(f"DOM 삽입 실패: {e}")
+
+    return False
 
 
 async def _enter_tags(page, tags):
