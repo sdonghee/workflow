@@ -735,7 +735,9 @@ async def _enter_content(page, content_html):
         xclip_ok = _xclip_write(content_html)
         if xclip_ok:
             try:
-                await input_frame.locator("body").click()
+                # about:blank body는 시각적으로 보이지 않아 locator click()이 타임아웃
+                # JS focus()로 직접 포커스 설정 (가시성 체크 없음)
+                await input_frame.evaluate("document.body.focus()")
                 await page.wait_for_timeout(500)
                 before_len = await input_frame.evaluate("document.body.innerHTML.length")
 
@@ -776,8 +778,8 @@ async def _enter_content(page, content_html):
         # Playwright 컨텍스트에 클립보드 권한 부여
         await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
 
-        # input_frame body 포커스 (클립보드 쓰기 전 문서 포커스 필요)
-        await input_frame.locator("body").click()
+        # input_frame body 포커스 (about:blank는 locator click 불가 → JS focus)
+        await input_frame.evaluate("document.body.focus()")
         await page.wait_for_timeout(500)
 
         before_len = await input_frame.evaluate("document.body.innerHTML.length")
@@ -802,8 +804,8 @@ async def _enter_content(page, content_html):
         }""", content_html)
         logger.info(f"클립보드 쓰기 결과: {clip_result}")
 
-        # input_frame body에 Ctrl+V 직접 전송 (실제 사용자 붙여넣기와 동일)
-        await input_frame.locator("body").press("Control+v")
+        # Ctrl+V 전송 (JS focus 후 page.keyboard 사용)
+        await page.keyboard.press("Control+v")
         await page.wait_for_timeout(2500)
 
         after_len = await input_frame.evaluate("document.body.innerHTML.length")
@@ -817,10 +819,10 @@ async def _enter_content(page, content_html):
     except Exception as e:
         logger.warning(f"clipboard+Ctrl+V 방식 실패: {e}")
 
-    # ── 방법 2: DataTransfer + ClipboardEvent paste (폴백) ──────────
+    # ── 방법 3: DataTransfer + ClipboardEvent paste (폴백) ──────────
     logger.info("DataTransfer paste 폴백 시도")
     try:
-        await input_frame.locator("body").click()
+        await input_frame.evaluate("document.body.focus()")
         await page.wait_for_timeout(300)
         before_len = await input_frame.evaluate("document.body.innerHTML.length")
 
