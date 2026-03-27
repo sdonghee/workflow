@@ -485,16 +485,105 @@ async def _enter_title(page, title):
 async def _enter_content(page, content_html):
     """본문 입력 - SmartEditor ONE
 
-    전략: SmartEditor 소스코드 버튼 클릭 → textarea에 HTML 직접 입력 (대용량 HTML 안전)
-    insertHTML은 SmartEditor에서 대용량 HTML 삽입 시 무음 실패하므로 사용하지 않음.
+    전략: DataTransfer + ClipboardEvent paste 이벤트 dispatch
+    - 사용자가 수동으로 복사-붙여넣기 하면 SmartEditor가 HTML을 수락함
+    - 이를 자동화: DataTransfer에 text/html 설정 → paste 이벤트 dispatch
+    - SmartEditor ONE은 소스코드 버튼 없음 (2022년 이후 제거)
+    - execCommand('insertHTML')은 대용량 HTML에서 무음 실패
     """
     main_frame = page.frame(name="mainFrame")
     if not main_frame:
         logger.warning("본문 입력 실패: mainFrame 없음")
         return
 
-    # ── 방법 1: SmartEditor 소스코드 버튼 ─────────────────────────
-    # 소스코드 버튼 → HTML textarea → 확인 버튼 → 본문 HTML 직접 삽입
+    # ── 본문 영역 클릭하여 포커스 ─────────────────────────────────
+    body_selectors = [
+        'p.se-placeholder',
+        '.se-placeholder',
+        '.se-main-section',
+        '.se-component:not(.se-component-title)',
+    ]
+    for sel in body_selectors:
+        try:
+            loc = main_frame.locator(sel).first
+            if await loc.count() > 0:
+                await loc.click(force=True)
+                logger.info(f"본문 영역 클릭: {sel}")
+                await page.wait_for_timeout(800)
+                break
+        except Exception as e:
+            logger.debug(f"본문 클릭 실패 ({sel}): {e}")
+
+    # ── input_buffer 프레임 대기 ──────────────────────────────────
+    input_frame = None
+    for wait_i in range(15):
+        input_frame = next((f for f in page.frames if f.name.startswith("input_buffer")), None)
+        if input_frame:
+            break
+        await page.wait_for_timeout(500)
+    if not input_frame:
+        logger.warning("input_buffer 프레임 없음")
+        return
+    logger.info(f"input_buffer 프레임: {input_frame.name}")
+
+    # ── 방법 1: DataTransfer + ClipboardEvent paste (메인 방식) ───
+    # 사용자가 외부 앱에서 복사-붙여넣기 하면 됨 → 이것을 자동화
+    logger.info(f"DataTransfer paste 이벤트 방식 시도 (HTML {len(content_html):,} bytes)")
+    try:
+        # 포커스 설정
+        await input_frame.locator("body").click()
+        await page.wait_for_timeout(300)
+
+        before_len = await input_frame.evaluate("document.body.innerHTML.length")
+
+        # DataTransfer에 text/html 설정 후 paste 이벤트 dispatch
+        paste_result = await input_frame.evaluate("""
+            (html) => {
+                try {
+                    var body = document.body;
+                    body.focus();
+
+                    // 커서를 본문 끝으로 이동
+                    var sel = window.getSelection();
+                    var range = document.createRange();
+                    range.selectNodeContents(body);
+                    range.collapse(false);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+
+                    // DataTransfer에 HTML 설정
+                    var dt = new DataTransfer();
+                    dt.setData('text/html', html);
+                    dt.setData('text/plain', body.innerText || '');
+
+                    // paste 이벤트 dispatch
+                    var pasteEvent = new ClipboardEvent('paste', {
+                        clipboardData: dt,
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    body.dispatchEvent(pasteEvent);
+
+                    return 'paste_dispatched:len=' + body.innerHTML.length;
+                } catch(e) {
+                    return 'error:' + e.message;
+                }
+            }
+        """, content_html)
+
+        await page.wait_for_timeout(1500)
+        after_len = await input_frame.evaluate("document.body.innerHTML.length")
+        logger.info(f"DataTransfer paste: {paste_result} → 길이 {before_len} → {after_len}")
+
+        if after_len > before_len + 50:
+            logger.info("본문 입력 완료 (DataTransfer paste 방식)")
+            return
+        else:
+            logger.warning(f"DataTransfer paste 후 변화 미미 ({before_len} → {after_len})")
+    except Exception as e:
+        logger.warning(f"DataTransfer paste 실패: {e}")
+
+    # ── 방법 2: 소스코드 버튼 탐색 (혹시 있을 경우) ─────────────
     logger.info("소스코드 버튼 방식으로 본문 삽입 시도")
 
     source_btn_selectors = [
@@ -634,57 +723,46 @@ async def _enter_content(page, content_html):
         else:
             logger.warning("소스코드 textarea 발견 실패")
 
-    # ── 방법 2: input_buffer에 직접 DOM 조작 (폴백) ────────────────
-    logger.info("폴백: input_buffer DOM 직접 조작")
-
-    body_selectors = [
-        'p.se-placeholder',
-        '.se-placeholder',
-        '.se-main-section',
-        '.se-component:not(.se-component-title)',
-    ]
-    for sel in body_selectors:
-        try:
-            loc = main_frame.locator(sel).first
-            if await loc.count() > 0:
-                await loc.click(force=True)
-                await page.wait_for_timeout(800)
-                break
-        except Exception:
-            pass
-
-    input_frame = None
-    for wait_i in range(12):
-        input_frame = next((f for f in page.frames if f.name.startswith("input_buffer")), None)
-        if input_frame:
-            break
-        await page.wait_for_timeout(500)
-    if not input_frame:
-        logger.warning("input_buffer 프레임 없음")
-        return
-
-    logger.info(f"폴백 프레임: {input_frame.name}")
+    # ── 방법 3: input_buffer DOM 직접 조작 + 다중 이벤트 (최후 폴백) ──
+    logger.info("최후 폴백: input_buffer DOM 직접 조작")
     try:
         before_len = await input_frame.evaluate("document.body.innerHTML.length")
 
-        # DOM 직접 삽입 + 이벤트 발생
         result = await input_frame.evaluate("""
             (html) => {
                 var body = document.body;
+                body.focus();
+
+                // paste 이벤트로 먼저 시도
+                try {
+                    var dt2 = new DataTransfer();
+                    dt2.setData('text/html', html);
+                    var pe2 = new ClipboardEvent('paste', {clipboardData: dt2, bubbles: true, cancelable: true});
+                    body.dispatchEvent(pe2);
+                } catch(e2) {}
+
+                // DOM 직접 삽입
                 var div = document.createElement('div');
                 div.innerHTML = html;
-                // 기존 placeholder p 뒤에 삽입
                 var children = Array.from(body.children);
                 var refNode = children.length > 1 ? children[1] : null;
                 if (refNode) body.insertBefore(div, refNode);
                 else body.appendChild(div);
-                body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}));
-                return 'dom:len=' + body.innerHTML.length;
+
+                // 여러 이벤트 발생시켜 SmartEditor에 변경 알림
+                ['input', 'keyup', 'change'].forEach(function(evtName) {
+                    try {
+                        body.dispatchEvent(new Event(evtName, {bubbles: true}));
+                    } catch(e) {}
+                });
+
+                return 'dom_fallback:len=' + body.innerHTML.length;
             }
         """, content_html)
-        logger.info(f"폴백 DOM 삽입: {result} (before={before_len})")
+        after_len = await input_frame.evaluate("document.body.innerHTML.length")
+        logger.info(f"최후 폴백 DOM 삽입: {result}, 길이 {before_len} → {after_len}")
     except Exception as e:
-        logger.error(f"폴백 DOM 삽입 실패: {e}", exc_info=True)
+        logger.error(f"최후 폴백 실패: {e}", exc_info=True)
 
 
 async def _enter_tags(page, tags):
