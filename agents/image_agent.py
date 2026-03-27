@@ -66,20 +66,26 @@ class ImageAgent(BaseAgent):
             {
                 "role": "user",
                 "content": (
-                    f"'{topic}' ({category}) 블로그 포스트 대표 이미지 검색에 쓸 "
-                    "영어 키워드를 2~3단어로만 반환하세요. 설명 없이."
+                    f"'{topic}' ({category}) 블로그 대표 이미지 검색 키워드를 2~3단어 영어로만 반환하세요.\n"
+                    "규칙: 연도/숫자/뉴스 단어 없이. 시간이 지나도 어울리는 범용 사진 키워드로.\n"
+                    "예) '항공권 할인' → 'airplane window seat' / '여행지 추천' → 'travel destination landscape'\n"
+                    "단어만, 설명 없이."
                 ),
             }
         ]
         result = self.chat(messages, max_tokens=30, temperature=0.3)
         if result:
-            # 첫 줄만, 30자 이내
-            return result.split("\n")[0].strip()[:40]
+            query = result.split("\n")[0].strip()[:40]
+            # 연도 숫자 제거 (2024, 2025, 2026 등)
+            import re
+            query = re.sub(r'\b20\d{2}\b', '', query).strip()
+            if query:
+                return query
         # 폴백: 카테고리 기본 키워드
         fallback = {
-            "여행_항공_호텔": "travel destination",
-            "정부혜택":       "community welfare",
-            "건강":          "healthy lifestyle",
+            "여행_항공_호텔": "travel destination landscape",
+            "정부혜택":       "community support people",
+            "건강":          "healthy lifestyle wellness",
         }
         return fallback.get(category, "korea lifestyle")
 
@@ -95,19 +101,22 @@ class ImageAgent(BaseAgent):
             {
                 "role": "user",
                 "content": (
-                    f"'{topic}' 주제 블로그 썸네일 이미지를 위한 "
-                    "Stable Diffusion 영어 프롬프트를 1줄(50단어 이하)로 작성하세요. "
-                    "스타일: professional photography, bright, clean, editorial quality. "
+                    f"'{topic}' 주제 블로그 썸네일용 Stable Diffusion 프롬프트를 1줄(40단어 이하)로 작성하세요.\n"
+                    "규칙: 연도/숫자/텍스트/로고 없는 사진. 시간이 지나도 어울리는 범용 여행·생활 이미지.\n"
+                    "스타일: professional photography, bright natural light, clean composition, no text, no year.\n"
                     "프롬프트만, 설명 없이."
                 ),
             }
         ]
         prompt_text = self.chat(messages, max_tokens=80, temperature=0.5)
         if not prompt_text:
-            prompt_text = f"{topic} professional photography blog thumbnail, bright colors"
+            prompt_text = f"travel lifestyle photography, bright natural light, clean composition, no text"
 
-        # 첫 줄만 사용
+        # 첫 줄만 사용, 연도 제거
+        import re
         prompt_text = prompt_text.split("\n")[0].strip()
+        prompt_text = re.sub(r'\b20\d{2}\b', '', prompt_text).strip()
+        prompt_text += ", no text, no logo, no year"
 
         seed    = random.randint(1, 99999)
         encoded = urllib.parse.quote(prompt_text)

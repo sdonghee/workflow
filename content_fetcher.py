@@ -209,45 +209,49 @@ def search_google_news_today(query, num=5):
     return articles
 
 
+def _is_relevant(article: dict, topic_hint: str) -> bool:
+    """기사 제목/요약이 topic_hint 키워드와 실제로 관련 있는지 간단 체크"""
+    if not topic_hint:
+        return True
+    # 주요 키워드(2글자 이상) 중 하나라도 포함하면 관련 있다고 판단
+    keywords = [w for w in topic_hint.replace(",", " ").split() if len(w) >= 2]
+    text = (article.get("title", "") + " " + article.get("summary", "")).lower()
+    return any(kw.lower() in text for kw in keywords[:6])
+
+
 def collect_topic_articles(topic_hint: str, category_config: dict, max_articles: int = 5) -> list:
     """
-    특정 주제에 대한 당일 기사를 여러 소스에서 수집.
-    같은 주제의 기사들을 모아 ContentAgent가 종합할 수 있도록 한다.
+    topic_hint 주제와 같은 기사를 당일 뉴스에서 수집.
+    카테고리 generic 쿼리는 사용하지 않아 주제 오염을 방지한다.
     """
     all_articles = []
     seen_titles: set = set()
 
-    # 1. 구글 뉴스 당일 기사 (주제 직접 검색)
+    def add_articles(candidates):
+        for a in candidates:
+            key = a["title"][:30]
+            if not key or key in seen_titles:
+                continue
+            if not _is_relevant(a, topic_hint):
+                logger.debug(f"[topic_filter] 관련성 낮아 제외: {a['title'][:40]}")
+                continue
+            seen_titles.add(key)
+            all_articles.append(a)
+
+    # 1. 구글 뉴스 당일 기사 — topic_hint 직접 검색
     if topic_hint:
-        articles = search_google_news_today(topic_hint, num=max_articles)
-        for a in articles:
-            key = a["title"][:30]
-            if key and key not in seen_titles:
-                seen_titles.add(key)
-                all_articles.append(a)
+        add_articles(search_google_news_today(topic_hint, num=max_articles))
 
-    # 2. 구글 뉴스 당일 기사 (카테고리 키워드)
-    for query in category_config.get("search_queries", [])[:2]:
-        if len(all_articles) >= max_articles:
-            break
-        articles = search_google_news_today(query, num=3)
-        for a in articles:
-            key = a["title"][:30]
-            if key and key not in seen_titles:
-                seen_titles.add(key)
-                all_articles.append(a)
+    # 2. 핵심 키워드만 뽑아 재검색 (2~3단어 단축 쿼리)
+    if len(all_articles) < 3 and topic_hint:
+        short = " ".join(topic_hint.split()[:3])
+        add_articles(search_google_news_today(short, num=3))
 
-    # 3. 부족하면 최근 기사로 보완 (당일 기사가 없는 카테고리 대비)
-    if len(all_articles) < 2:
-        for query in category_config.get("search_queries", [])[:2]:
-            articles = search_google_news(query, num=3)
-            for a in articles:
-                key = a["title"][:30]
-                if key and key not in seen_titles:
-                    seen_titles.add(key)
-                    all_articles.append(a)
+    # 3. 당일 기사가 없으면 최근 기사로 보완 (topic_hint 유지)
+    if len(all_articles) < 2 and topic_hint:
+        add_articles(search_google_news(topic_hint, num=4))
 
-    # 4. 전문 수집 (상위 기사만)
+    # 4. 기사 본문 수집
     enriched = []
     for article in all_articles[:max_articles]:
         if article.get("link"):
@@ -259,7 +263,7 @@ def collect_topic_articles(topic_hint: str, category_config: dict, max_articles:
                 pass
         enriched.append(article)
 
-    logger.info(f"[topic_articles] '{topic_hint[:30]}': {len(enriched)}개 기사 수집 완료")
+    logger.info(f"[topic_articles] '{topic_hint[:30]}': {len(enriched)}개 관련 기사 수집")
     return enriched
 
 
