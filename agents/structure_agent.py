@@ -89,8 +89,9 @@ class StructureAgent(BaseAgent):
         for point in main_pts:
             heading  = point.get("heading", "")
             content  = point.get("content", "")
-            tip      = point.get("tip", "")
-            box_type = point.get("box_type", "info")
+            tip      = point.get("tip", "")      # 구형 호환
+            action   = point.get("action", tip)  # 신형: 즉시 실행 행동
+            box_type = point.get("box_type", "tip")
 
             parts.append(f'<h2 style="{H2_STYLE}">{heading}</h2>')
 
@@ -100,12 +101,12 @@ class StructureAgent(BaseAgent):
                 if para:
                     parts.append(f'<p style="{BODY_STYLE}">{para}</p>')
 
-            # 팁 박스
-            if tip:
-                bstyle = BOX_STYLES.get(box_type, BOX_STYLES["info"])
+            # 즉시 실행 행동 박스
+            if action:
+                bstyle = BOX_STYLES.get(box_type, BOX_STYLES["tip"])
                 parts.append(
                     f'<div style="{bstyle}{BASE_FONT}">'
-                    f'<strong style="font-size:15px;">{tip}</strong>'
+                    f'<strong style="font-size:15px;">✅ 지금 바로: {action}</strong>'
                     f'</div>'
                 )
 
@@ -153,13 +154,30 @@ class StructureAgent(BaseAgent):
                     parts.append(f'<p style="{BODY_STYLE}padding-left:8px;">A. {a}</p>')
             parts.append(HR)
 
-        # ── [G] 결론 + CTA ─────────────────────────────────────────
-        if conclusion or cta:
+        # ── [G] 결론 + 행동 체크리스트 ────────────────────────────
+        checklist = content_data.get("checklist", [])
+        if conclusion or cta or checklist:
             inner = ""
             if conclusion:
-                inner += f'<p style="font-size:16px;line-height:1.8;color:#333;margin:0 0 12px;">🎯 {conclusion}</p>'
+                inner += (
+                    f'<p style="font-size:17px;font-weight:bold;line-height:1.8;'
+                    f'color:#1a1a2e;margin:0 0 14px;">🎯 {conclusion}</p>'
+                )
+            if checklist:
+                items = "".join(
+                    f'<li style="margin:8px 0;font-size:15px;">☑ {item}</li>'
+                    for item in checklist
+                )
+                inner += (
+                    f'<p style="font-weight:bold;font-size:15px;margin:12px 0 6px;">'
+                    f'지금 바로 해보세요:</p>'
+                    f'<ul style="margin:0;padding-left:20px;">{items}</ul>'
+                )
             if cta:
-                inner += f'<p style="font-size:16px;font-weight:bold;color:#27AE60;margin:0;">👉 {cta}</p>'
+                inner += (
+                    f'<p style="font-size:15px;font-weight:bold;color:#27AE60;'
+                    f'margin:14px 0 0;">👉 {cta}</p>'
+                )
             parts.append(
                 f'<div style="{BOX_STYLES["tip"]}{BASE_FONT}">{inner}</div>'
             )
