@@ -485,11 +485,11 @@ async def _enter_title(page, title):
 async def _enter_content(page, content_html):
     """본문 입력 - SmartEditor ONE
 
-    핵심: mainFrame의 본문 영역을 Playwright click()으로 포커스한 뒤
-    input_buffer에서 insertHTML. execCommand는 선택 없으면 true를 반환해도
-    실제로 삽입되지 않으므로 innerHTML 길이 변화로 검증.
+    핵심: Playwright evaluate() 인자 전달로 HTML 안전하게 전달.
+    JS 템플릿 리터럴 직접 삽입 방식은 대용량 HTML에서 깨짐 → 인자 방식 사용.
     """
-    safe_html = content_html.replace("`", "'").replace("\\", "\\\\").replace("\n", "")
+    # safe_html은 더 이상 JS 인라인 삽입에 쓰지 않고 인자로 전달
+    safe_html = content_html  # Playwright evaluate(fn, arg)가 JSON 직렬화로 안전하게 전달
 
     main_frame = page.frame(name="mainFrame")
     if not main_frame:
@@ -591,23 +591,25 @@ async def _enter_content(page, content_html):
 
         before_len = diag['bodyLen']
 
-        # ── 1차: 현재 커서 위치에 insertHTML ────────────────────────
-        ok1 = await input_frame.evaluate(f"document.execCommand('insertHTML', false, `{safe_html}`)")
+        # ── 1차: insertHTML (Playwright 인자 전달 - JS 인라인 삽입 X) ──
+        ok1 = await input_frame.evaluate(
+            "(html) => document.execCommand('insertHTML', false, html)",
+            safe_html
+        )
         after_len1 = await input_frame.evaluate("document.body.innerHTML.length")
         logger.info(f"1차 insertHTML: ok={ok1}, 길이 {before_len} → {after_len1}")
 
         if after_len1 > before_len + 10:
-            logger.info("본문 입력 완료 (1차: insertHTML at cursor)")
+            logger.info("본문 입력 완료 (1차: insertHTML)")
             return
 
-        # ── 2차: body 두 번째 자식 위치로 커서 강제 이동 후 insertHTML
+        # ── 2차: 커서 이동 후 insertHTML ────────────────────────────
         logger.warning("1차 삽입 변화 미미 → 2차: 커서 이동 후 삽입")
-        result2 = await input_frame.evaluate(f"""
-            (function() {{
+        result2 = await input_frame.evaluate("""
+            (html) => {
                 var body = document.body;
                 var children = Array.from(body.children);
                 if (children.length === 0) return 'no_children';
-                // 두 번째 자식이 있으면 두 번째, 없으면 첫 번째 끝으로 커서 이동
                 var targetEl = children.length > 1 ? children[1] : children[0];
                 var sel = window.getSelection();
                 var range = document.createRange();
@@ -615,36 +617,35 @@ async def _enter_content(page, content_html):
                 range.collapse(true);
                 sel.removeAllRanges();
                 sel.addRange(range);
-                var ok2 = document.execCommand('insertHTML', false, `{safe_html}`);
+                var ok2 = document.execCommand('insertHTML', false, html);
                 return 'ok=' + ok2 + ':len=' + body.innerHTML.length;
-            }})()
-        """)
+            }
+        """, safe_html)
         after_len2 = await input_frame.evaluate("document.body.innerHTML.length")
         logger.info(f"2차 삽입: {result2}, 길이 {after_len2}")
 
-        if after_len2 > before_len + 50:
+        if after_len2 > before_len + 10:
             logger.info("본문 입력 완료 (2차: cursor-moved insertHTML)")
             return
 
         # ── 3차: DOM 직접 삽입 (최후 수단) ─────────────────────────
         logger.warning("3차: DOM 직접 조작")
-        result3 = await input_frame.evaluate(f"""
-            (function() {{
+        result3 = await input_frame.evaluate("""
+            (html) => {
                 var body = document.body;
                 var children = Array.from(body.children);
                 var div = document.createElement('div');
-                div.innerHTML = `{safe_html}`;
-                // 두 번째 자식 이후에 삽입 (첫 번째는 제목)
+                div.innerHTML = html;
                 var refNode = children.length > 1 ? children[1] : null;
-                if (refNode) {{
+                if (refNode) {
                     body.insertBefore(div, refNode);
-                }} else {{
+                } else {
                     body.appendChild(div);
-                }}
-                body.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
+                }
+                body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText'}));
                 return 'dom:len=' + body.innerHTML.length;
-            }})()
-        """)
+            }
+        """, safe_html)
         logger.info(f"3차 DOM 삽입: {result3}")
 
     except Exception as e:
