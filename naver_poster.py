@@ -355,42 +355,113 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
             await _enter_content(page, content_with_tags)
             await page.wait_for_timeout(1500)
 
-            # [스크린샷 3] 본문 입력 후
+            # [스크린샷 3] 본문 입력 후 (참고용)
             await _screenshot(page, "03_after_content", run_id)
 
-            # 6-0. PostSaveAjax 인터셉트: SmartEditor DOM 삽입 실패 우회
-            # SmartEditor가 발행 시 빈 contents를 서버로 보내더라도
-            # 우리가 contents 필드를 실제 HTML로 교체해서 발행
-            _inject_html = content_with_tags  # 클로저로 캡처
+            # 6. 브라우저 fetch()로 PostSaveAjax 직접 호출 (SmartEditor 완전 우회)
+            # SmartEditor DOM 조작 / route 인터셉트 모두 불필요
+            # 브라우저 세션(쿠키)을 그대로 사용하므로 인증 문제 없음
+            tag_list_str = tags
+            blog_id_str = blog_config["blog_id"]
 
-            async def _route_inject_content(route):
-                request = route.request
+            # blogNo 추출 (mainFrame JS 컨텍스트에서)
+            blog_no = ""
+            if main_frame:
                 try:
-                    raw = request.post_data or ""
-                    if raw:
-                        parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
-                        parsed["contents"] = [_inject_html]
-                        modified = urllib.parse.urlencode(
-                            {k: v[0] for k, v in parsed.items()}
-                        )
-                        logger.info(
-                            f"[Route] PostSaveAjax 가로채기 → contents {len(_inject_html):,} bytes 주입"
-                        )
-                        await route.continue_(post_data=modified)
-                    else:
-                        await route.continue_()
+                    blog_no = await main_frame.evaluate("""
+                        () => {
+                            if (window.__blogNo) return String(window.__blogNo);
+                            // nts_blog 객체
+                            if (window.nts_blog && window.nts_blog.blogNo)
+                                return String(window.nts_blog.blogNo);
+                            // 스크립트 태그 파싱
+                            for (var s of Array.from(document.scripts)) {
+                                var m = s.text.match(/"blogNo"\s*:\s*"?(\d+)"?/);
+                                if (m) return m[1];
+                                var m2 = s.text.match(/blogNo\s*=\s*['"]?(\d+)['"]?/);
+                                if (m2) return m2[1];
+                            }
+                            return '';
+                        }
+                    """)
+                    logger.info(f"[BrowserFetch] blogNo 추출: '{blog_no}'")
                 except Exception as e:
-                    logger.warning(f"[Route] 인터셉트 처리 오류: {e}")
-                    await route.continue_()
+                    logger.warning(f"[BrowserFetch] blogNo 추출 실패: {e}")
 
-            await page.route("**/PostSaveAjax.naver**", _route_inject_content)
-            logger.info("[Route] PostSaveAjax 인터셉트 등록 완료")
+            logger.info(f"[BrowserFetch] PostSaveAjax 직접 호출 시작 "
+                       f"(title={title[:30]}, contents={len(content_with_tags):,}bytes)")
 
-            # 6. 발행
-            success = await _publish(page, run_id)
+            fetch_result = await page.evaluate("""
+                async ({title, contents, blogId, blogNo, tags}) => {
+                    try {
+                        const params = new URLSearchParams();
+                        params.append('blogId',              blogId);
+                        params.append('blogNo',              blogNo);
+                        params.append('logNo',               '0');
+                        params.append('title',               title);
+                        params.append('contents',            contents);
+                        params.append('categoryNo',          '0');
+                        params.append('tag',                 tags);
+                        params.append('type',                'post');
+                        params.append('status',              'publish');
+                        params.append('useRssYN',            'Y');
+                        params.append('allowComment',        'true');
+                        params.append('allowLike',           'true');
+                        params.append('allowExternalSearch', 'true');
+                        params.append('addCategoryYN',       'N');
+                        params.append('addContents',         '');
+                        params.append('publishDate',         '');
+                        params.append('publishTime',         '');
+                        params.append('cclUploadLicense',    '');
+                        params.append('cclCommercial',       '');
+                        params.append('cclModification',     '');
 
-            # 인터셉트 해제
-            await page.unroute("**/PostSaveAjax.naver**")
+                        const resp = await fetch('https://blog.naver.com/PostSaveAjax.naver', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'X-Requested-With': 'XMLHttpRequest',
+                            },
+                            credentials: 'include',
+                            body: params.toString(),
+                        });
+                        const text = await resp.text();
+                        return {ok: resp.ok, status: resp.status, text: text.substring(0, 1000)};
+                    } catch(e) {
+                        return {ok: false, status: 0, text: 'fetch_error: ' + e.message};
+                    }
+                }
+            """, {
+                "title":    title,
+                "contents": content_with_tags,
+                "blogId":   blog_id_str,
+                "blogNo":   blog_no,
+                "tags":     tag_list_str,
+            })
+
+            logger.info(f"[BrowserFetch] 응답: status={fetch_result['status']}, "
+                       f"text={fetch_result['text'][:300]}")
+
+            fetch_text = fetch_result.get("text", "")
+            fetch_ok   = fetch_result.get("ok", False)
+
+            # 성공 판단: logNo 또는 SUCCESS 포함
+            import re as _re
+            log_no_match = _re.search(r'"logNo"\s*:\s*"?(\d+)"?', fetch_text)
+            success = (
+                log_no_match is not None or
+                "SUCCESS" in fetch_text.upper() or
+                (fetch_ok and "error" not in fetch_text.lower() and fetch_result['status'] == 200)
+            )
+
+            if log_no_match:
+                log_no = log_no_match.group(1)
+                logger.info(f"[BrowserFetch] ✅ 발행 성공! logNo={log_no} "
+                           f"→ https://blog.naver.com/{blog_id_str}/{log_no}")
+            elif success:
+                logger.info("[BrowserFetch] ✅ 발행 성공 (200 OK)")
+            else:
+                logger.error(f"[BrowserFetch] ❌ 발행 실패: {fetch_text[:200]}")
 
             # [스크린샷 6] 발행 후 최종 상태
             await _screenshot(page, "06_after_publish", run_id)
