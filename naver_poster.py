@@ -8,6 +8,8 @@ import asyncio
 import logging
 import json
 import os
+import subprocess
+import time
 import urllib.parse
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -16,6 +18,75 @@ from config import HEADLESS
 SCREENSHOT_DIR = "/app/screenshots"
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────
+# Xvfb 가상 디스플레이 (Docker 클립보드 지원)
+# ─────────────────────────────────────────
+
+_xvfb_proc = None
+
+
+def _ensure_xvfb() -> bool:
+    """Xvfb 가상 X11 디스플레이 시작 (없으면 headless 유지)
+
+    SmartEditor ONE은 실제 시스템 클립보드 Ctrl+V만 허용.
+    Docker headless 환경에서는 X11 디스플레이 없이 xclip 불가 → Xvfb로 해결.
+    """
+    global _xvfb_proc
+    if os.environ.get("DISPLAY"):
+        logger.info(f"DISPLAY 이미 설정: {os.environ['DISPLAY']}")
+        return True
+    try:
+        _xvfb_proc = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        time.sleep(1.5)  # Xvfb 초기화 대기
+        logger.info("✅ Xvfb :99 시작 → DISPLAY=:99 (비headless 모드로 전환)")
+        return True
+    except FileNotFoundError:
+        logger.warning("Xvfb 없음 → headless 모드 유지 (클립보드 제한)")
+        return False
+    except Exception as e:
+        logger.warning(f"Xvfb 시작 실패: {e}")
+        return False
+
+
+def _xclip_write(html: str) -> bool:
+    """HTML을 X11 클립보드에 씀 (xclip 사용)"""
+    if not os.environ.get("DISPLAY"):
+        return False
+    try:
+        # text/html 타입으로 클립보드에 저장
+        r = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-t", "text/html"],
+            input=html.encode("utf-8"),
+            timeout=15,
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            logger.info(f"xclip text/html 저장 완료 ({len(html):,} bytes)")
+            return True
+        # 실패 시 plain text로 재시도
+        r2 = subprocess.run(
+            ["xclip", "-selection", "clipboard"],
+            input=html.encode("utf-8"),
+            timeout=15,
+            capture_output=True,
+        )
+        if r2.returncode == 0:
+            logger.info(f"xclip text 저장 완료 ({len(html):,} bytes)")
+            return True
+        logger.warning(f"xclip 실패 (rc={r.returncode}): {r.stderr.decode()[:100]}")
+        return False
+    except FileNotFoundError:
+        logger.warning("xclip 없음")
+        return False
+    except Exception as e:
+        logger.warning(f"xclip 예외: {e}")
+        return False
 
 
 # ─────────────────────────────────────────
@@ -149,7 +220,16 @@ def _is_missing_lib_error(e: Exception) -> bool:
 
 
 async def _launch_browser(p):
-    """Chromium → Firefox 순으로 시도, 둘 다 실패 시 BrowserUnavailableError"""
+    """Chromium → Firefox 순으로 시도, 둘 다 실패 시 BrowserUnavailableError
+
+    DISPLAY 환경변수가 있으면 (Xvfb) headless=False 로 실행 → 시스템 클립보드 사용 가능
+    """
+    # Xvfb가 있으면 headless=False (실제 X11 클립보드 사용)
+    # 없으면 설정값(HEADLESS) 사용
+    xvfb_active = bool(os.environ.get("DISPLAY"))
+    use_headless = False if xvfb_active else HEADLESS
+    logger.info(f"브라우저 headless={use_headless} (DISPLAY={os.environ.get('DISPLAY','없음')})")
+
     chromium_args = [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -158,7 +238,7 @@ async def _launch_browser(p):
     ]
     # 1) Chromium
     try:
-        browser = await p.chromium.launch(headless=HEADLESS, args=chromium_args)
+        browser = await p.chromium.launch(headless=use_headless, args=chromium_args)
         logger.info("브라우저: Chromium")
         return browser, "chromium"
     except Exception as e:
@@ -192,6 +272,9 @@ async def post_to_naver_blog(title, content_html, tags, category, blog_config):
     네이버 블로그에 글 포스팅
     blog_config: BLOGS dict의 개별 블로그 설정
     """
+    # Xvfb 가상 디스플레이 시작 (Docker 환경에서 시스템 클립보드 사용 가능하게)
+    _ensure_xvfb()
+
     # 실행마다 고유 폴더에 스크린샷 저장 (예: 20260326_153012)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{blog_config.get('blog_id','')}"
 
@@ -644,7 +727,48 @@ async def _enter_content(page, content_html):
         return False
     logger.info(f"input_buffer 프레임: {input_frame.name}")
 
-    # ── 방법 1: navigator.clipboard.write() + Ctrl+V (메인 방식) ─────
+    # ── 방법 1: xclip (X11 클립보드) + Ctrl+V ────────────────────────
+    # Docker + Xvfb 환경: xclip으로 시스템 클립보드에 HTML 저장 → Ctrl+V
+    # 사용자가 외부 앱에서 복붙하는 것과 100% 동일한 경로
+    logger.info(f"xclip 방식 시도 (DISPLAY={os.environ.get('DISPLAY','없음')}, HTML {len(content_html):,} bytes)")
+    if os.environ.get("DISPLAY"):
+        xclip_ok = _xclip_write(content_html)
+        if xclip_ok:
+            try:
+                await input_frame.locator("body").click()
+                await page.wait_for_timeout(500)
+                before_len = await input_frame.evaluate("document.body.innerHTML.length")
+
+                await page.keyboard.press("Control+v")
+                await page.wait_for_timeout(2500)
+
+                after_len = await input_frame.evaluate("document.body.innerHTML.length")
+                logger.info(f"xclip Ctrl+V: {before_len} → {after_len} (변화: {after_len - before_len})")
+
+                # SmartEditor는 paste 후 input_buffer를 정리할 수 있으므로
+                # mainFrame의 실제 내용도 확인
+                main_content = await main_frame.evaluate("""
+                    () => {
+                        var els = document.querySelectorAll(
+                            '.se-text-paragraph, .se-component-content, .se-module-text');
+                        var total = 0;
+                        els.forEach(function(e) { total += e.textContent.trim().length; });
+                        return total;
+                    }
+                """)
+                logger.info(f"mainFrame 텍스트 길이: {main_content}")
+
+                if after_len > before_len + 50 or main_content > 100:
+                    logger.info("✅ 본문 입력 완료 (xclip + Ctrl+V 방식)")
+                    return True
+                else:
+                    logger.warning(f"xclip Ctrl+V 후 변화 없음 → 다음 방법 시도")
+            except Exception as e:
+                logger.warning(f"xclip Ctrl+V 실패: {e}")
+        else:
+            logger.warning("xclip 저장 실패 → navigator.clipboard 시도")
+
+    # ── 방법 2: navigator.clipboard.write() + Ctrl+V (메인 방식) ─────
     # 사용자가 수동으로 복사-붙여넣기 할 때와 완전히 동일한 경로
     # SmartEditor가 실제 paste 이벤트로 처리 → 내부 JSON 포맷 변환
     logger.info(f"navigator.clipboard + Ctrl+V 방식 시도 (HTML {len(content_html):,} bytes)")
