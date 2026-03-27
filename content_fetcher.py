@@ -194,6 +194,75 @@ def search_google_news(query, num=5):
     return articles
 
 
+def search_google_news_today(query, num=5):
+    """구글 뉴스 RSS — 당일(24시간 이내) 기사만 검색"""
+    articles = []
+    try:
+        today_query = f"{query} when:1d"
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(today_query)}&hl=ko&gl=KR&ceid=KR:ko"
+        articles = fetch_rss_articles(url, max_articles=num)
+        for a in articles:
+            a["source"] = "google_news_today"
+        logger.info(f"구글 뉴스(당일) '{query}'에서 {len(articles)}개 기사 수집")
+    except Exception as e:
+        logger.error(f"구글 뉴스(당일) 검색 실패 '{query}': {e}")
+    return articles
+
+
+def collect_topic_articles(topic_hint: str, category_config: dict, max_articles: int = 5) -> list:
+    """
+    특정 주제에 대한 당일 기사를 여러 소스에서 수집.
+    같은 주제의 기사들을 모아 ContentAgent가 종합할 수 있도록 한다.
+    """
+    all_articles = []
+    seen_titles: set = set()
+
+    # 1. 구글 뉴스 당일 기사 (주제 직접 검색)
+    if topic_hint:
+        articles = search_google_news_today(topic_hint, num=max_articles)
+        for a in articles:
+            key = a["title"][:30]
+            if key and key not in seen_titles:
+                seen_titles.add(key)
+                all_articles.append(a)
+
+    # 2. 구글 뉴스 당일 기사 (카테고리 키워드)
+    for query in category_config.get("search_queries", [])[:2]:
+        if len(all_articles) >= max_articles:
+            break
+        articles = search_google_news_today(query, num=3)
+        for a in articles:
+            key = a["title"][:30]
+            if key and key not in seen_titles:
+                seen_titles.add(key)
+                all_articles.append(a)
+
+    # 3. 부족하면 최근 기사로 보완 (당일 기사가 없는 카테고리 대비)
+    if len(all_articles) < 2:
+        for query in category_config.get("search_queries", [])[:2]:
+            articles = search_google_news(query, num=3)
+            for a in articles:
+                key = a["title"][:30]
+                if key and key not in seen_titles:
+                    seen_titles.add(key)
+                    all_articles.append(a)
+
+    # 4. 전문 수집 (상위 기사만)
+    enriched = []
+    for article in all_articles[:max_articles]:
+        if article.get("link"):
+            try:
+                full = fetch_web_content(article["link"])
+                if full:
+                    article["content"] = full
+            except Exception:
+                pass
+        enriched.append(article)
+
+    logger.info(f"[topic_articles] '{topic_hint[:30]}': {len(enriched)}개 기사 수집 완료")
+    return enriched
+
+
 def collect_content_for_category(category_name, category_config, num_posts=3):
     """카테고리별 콘텐츠 수집"""
     all_articles = []

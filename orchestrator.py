@@ -184,19 +184,25 @@ JSON 배열만 반환 (다른 텍스트 없음):
         logger.info(f"[Pipeline] [{blog_name}] {category}")
         logger.info(f"[Pipeline] 주제 힌트: {topic_hint[:60]}")
 
-        # ── 1. 리서치 ──────────────────────────────────────────────
-        logger.info("[1/5] ResearchAgent 실행")
-        articles = self.research.get_articles(category, max_count=3)
-        article  = articles[0] if articles else {
-            "title": topic_hint or category, "summary": topic_hint, "link": "", "content": ""
-        }
-        if topic_hint and not article.get("summary"):
-            article["summary"] = topic_hint
-        step_log.append({"step": "research", "ok": bool(articles)})
+        # ── 1. 리서치 — 당일 기사 여러 개 수집 ────────────────────
+        logger.info("[1/5] ResearchAgent 실행 (당일 기사 복수 수집)")
+        articles = self.research.get_todays_articles(
+            topic_hint or category, category, max_articles=5
+        )
+        if not articles:
+            articles = [{
+                "title": topic_hint or category,
+                "summary": topic_hint,
+                "link": "",
+                "content": "",
+            }]
+        # 첫 번째 기사 (대표 링크용)
+        article = articles[0]
+        step_log.append({"step": "research", "ok": bool(articles), "count": len(articles)})
 
-        # ── 2. 콘텐츠 생성 ────────────────────────────────────────
-        logger.info("[2/5] ContentAgent 실행")
-        content_data = self.content.generate(article, category)
+        # ── 2. 콘텐츠 생성 — 여러 기사 종합 ─────────────────────────
+        logger.info(f"[2/5] ContentAgent 실행 (기사 {len(articles)}개 종합)")
+        content_data = self.content.generate(articles, category)
         step_log.append({"step": "content", "ok": bool(content_data)})
         if not content_data:
             logger.error("[Pipeline] 콘텐츠 생성 실패 — 태스크 중단")

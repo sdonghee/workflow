@@ -89,7 +89,7 @@ CATEGORIES = {
         ],
         "image_keywords": ["travel", "hotel", "airplane", "vacation", "tourism"],
         "tags": ["여행", "해외여행", "국내여행", "항공", "호텔", "여행팁", "여행추천", "호캉스", "여행정보", "관광"],
-        "post_count": 4,
+        "post_count": 3,
     },
     "정부혜택": {
         "keywords": [
@@ -110,7 +110,7 @@ CATEGORIES = {
         ],
         "image_keywords": ["government", "welfare", "support", "community", "Korea"],
         "tags": ["정부혜택", "정부지원금", "복지혜택", "청년지원", "노인복지", "사회보험", "정부보조금", "복지신청", "지원정책", "생활정보"],
-        "post_count": 3,
+        "post_count": 2,
     },
     "건강": {
         "keywords": [
@@ -131,7 +131,7 @@ CATEGORIES = {
         ],
         "image_keywords": ["health", "fitness", "wellness", "medicine", "exercise"],
         "tags": ["건강", "건강정보", "건강관리", "다이어트", "운동", "영양", "질병예방", "건강식품", "의학정보", "웰빙"],
-        "post_count": 3,
+        "post_count": 1,
     },
 }
 

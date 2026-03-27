@@ -12,7 +12,7 @@ from typing import List, Dict, Tuple, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.base_agent import BaseAgent, LLAMA_70B, QWEN3_80B, NEMOTRON_120B, GPT_OSS_120B, MINIMAX, HERMES_405B, MISTRAL_24B, GEMMA_27B, GLM_45
-from content_fetcher import collect_all_content, fetch_web_content
+from content_fetcher import collect_all_content, fetch_web_content, collect_topic_articles
 from config import CATEGORIES
 
 logger = logging.getLogger(__name__)
@@ -117,6 +117,24 @@ JSON 배열로만 반환:
             }
             for kw in keywords[:count]
         ]
+
+    def get_todays_articles(self, topic_hint: str, category: str, max_articles: int = 5) -> List[dict]:
+        """
+        오늘 발행된 기사 중 topic_hint 주제와 관련된 기사를 여러 개 수집.
+        ContentAgent가 이 기사들을 종합해 더 풍부한 블로그 글을 작성한다.
+        """
+        logger.info(f"[ResearchAgent] 당일 기사 수집 — 주제: '{topic_hint[:40]}'")
+
+        cat_cfg = CATEGORIES.get(category, {})
+        articles = collect_topic_articles(topic_hint, cat_cfg, max_articles=max_articles)
+
+        # 기사가 1개도 없으면 AI로 주제 생성
+        if not articles:
+            logger.warning(f"[ResearchAgent] 당일 기사 없음 — AI 주제 생성으로 대체")
+            articles = self._generate_topics(category, 2)
+
+        logger.info(f"[ResearchAgent] '{topic_hint[:30]}' 관련 기사 {len(articles)}개 준비")
+        return articles
 
     def analyze_todays_trends(self, categories: List[str]) -> dict:
         """
