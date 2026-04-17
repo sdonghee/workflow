@@ -1,0 +1,28 @@
+﻿320252a (HEAD -> claude/test-workflow-22Sus, origin/claude/test-workflow-22Sus) Fix: 肄섑뀗痢??덉쭏 4媛吏 媛쒖꽑
+34c8f26 Feature: ?뱀씪 理쒖떊 湲곗궗 蹂듭닔 ?섏쭛 ??醫낇빀 釉붾줈洹??먮룞 ?앹꽦
+562ec10 Refactor: 肄섑뀗痢??덉쭏 湲곗? - ?듭떖 3媛吏 吏묒쨷, ?源??낆옄 紐낇솗?? 怨쇱옣 ?섏튂 ?쒓굅
+059400e Fix: StructureAgent AI ?몄텧 ?쒓굅 ??Python 吏곸젒 HTML ?앹꽦
+9117747 Fix: 肄섑뀗痢??덉쭏 媛쒖꽑 - ?⑥씪 二쇱젣 吏묒쨷 + 由ъ꽌移?湲곕컲 + 留덉????꾨Ц媛 媛?대뱶 諛섏쁺
+64cb9d1 Fix: xclip Popen(鍮꾩감?? + mainFrame ?ъ빱?ㅻ줈 Ctrl+V ?寃??섏젙
+7e5a996 Fix: input_buffer focus - JS focus() ???locator click() ?ъ슜 (about:blank visibility ?ㅻ쪟 ?닿껐)
+0705e0e Fix: Xvfb + xclip?쇰줈 Docker ?ㅻ뱶由ъ뒪 ?대┰蹂대뱶 臾몄젣 ?꾩쟾 ?닿껐
+23898b4 Fix: navigator.clipboard + Ctrl+V 諛⑹떇?쇰줈 SmartEditor 蹂몃Ц ?쎌엯 ?ш뎄??c6bb086 Replace SmartEditor automation with browser fetch() to PostSaveAjax
+eb31e63 Fix content insertion via page.route() intercepting PostSaveAjax.naver
+2118c72 Fix: DataTransfer+ClipboardEvent paste as primary content insertion method
+9256a75 Fix content insertion: use SmartEditor ?뚯뒪肄붾뱶 button for large HTML
+c555a27 Fix: _enter_content - JS ?쒗뵆由?由ы꽣???몃씪???쎌엯 ??Playwright ?몄옄 ?꾨떖 諛⑹떇
+a02f1a1 Fix: 1李?insertHTML ?꾧퀎媛?50??0 (吏㏃? 肄섑뀗痢?以묐났 ?쎌엯 諛⑹?)
+a555b9a Fix: load_cookies 鍮??뚯씪 泥섎━ (JSONDecodeError 諛⑹?)
+e258a88 Fix: ?섎せ??釉붾줈洹?由щ떎?대젆??媛먯? + Dockerfile pip trusted-host
+ea7f11b Fix: SmartEditor 濡쒕뱶 ?꾨즺 ?湲?+ input_buffer ?대쭅 (flighttravel 怨꾩젙 ?명솚)
+b79e378 Fix: 荑좏궎 留뚮즺 ??湲?곌린 URL?먯꽌 濡쒓렇???섏씠吏 由щ떎?대젆??媛먯? ???먮룞 ?щ줈洹몄씤
+e6a18c1 Fix: _CONFIRM_JS - ?⑤꼸 ?뺤씤 踰꾪듉 ?뺥솗???대┃ (y醫뚰몴 理쒕?媛?湲곗?)
+ad7b8a0 Fix: _enter_content - mainFrame 蹂몃Ц ?대┃ + ?쎌엯 ??吏꾨떒 + 湲몄씠 寃利?d7ebf3c Fix: input_buffer ?꾨젅?꾩씠 ?쒕ぉ ?꾨젅?꾩엫???뺤씤 ??蹂몃Ц ?꾨젅??遺꾨━
+9a9c525 Fix: beforeunload ?덉슜 + 寃利?濡쒖쭅 ?섏젙
+9fcaaa9 Fix: '?묒꽦 以묒씤 湲' HTML ?앹뾽 泥섎━ 異붽?
+89417d4 Fix: Frame.mouse ?ㅻ쪟 諛?body not visible ?ㅻ쪟 ?섏젙
+08fb23a Fix: ?쒕ぉ/蹂몃Ц ?낅젰??Playwright click() ??keyboard/execCommand 諛⑹떇?쇰줈 ?꾪솚
+affd395 吏꾨떒: 媛??④퀎 ?ㅽ겕由곗꺑 ???+ 諛쒗뻾 ???ㅼ젣 釉붾줈洹?寃利?異붽?
+ea2ed2e Fix: _CONFIRM_JS 'not_found' truthy 踰꾧렇 ?섏젙 ??諛쒗뻾 ?뺤씤 踰꾪듉 誘몃컻寃??쒖뿉??True 諛섑솚?섎뜕 臾몄젣 ?닿껐
+28b2a9a Fix publish confirm: exclude toolbar buttons; add dialog handler
+08bf8e2 Fix publish confirm: click panel 諛쒗뻾 button not ?뺤씤; use execCommand for content

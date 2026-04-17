@@ -11,17 +11,17 @@ from email.mime.text import MIMEText
 from datetime import datetime
 import sys
 import os
+import subprocess
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+# 누락된 import 추가
 from agents.base_agent import BaseAgent, LLAMA_70B, HERMES_405B
-from naver_poster import post_blog, save_post_locally, BrowserUnavailableError
+from naver_poster import save_post_locally
 from config import BLOGS, GMAIL_ADDRESS, GMAIL_APP_PASSWORD
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES   = 3
-RETRY_DELAYS  = [30, 90, 180]   # 초 (0.5분 → 1.5분 → 3분)
+MAX_RETRIES = 3
+RETRY_DELAYS = [30, 90, 180]  # 초 (0.5분 → 1.5분 → 3분)
 
 
 class DeployAgent(BaseAgent):
@@ -40,12 +40,13 @@ class DeployAgent(BaseAgent):
         content_html: str,
         tags: str,
         category: str,
+        sections: list | None = None,
     ) -> dict:
         """
-        포스트 게시 (최대 3회 재시도).
-
-        Returns:
-            {success: bool, attempts: int, message: str}
+        [수정] 포스트 게시 로직: subprocess로 naver_poster.py를 완전히 분리하여 실행
+        1. 포스트 내용을 임시 JSON draft 파일로 저장
+        2. `subprocess.run(['python', 'naver_poster.py', '--draft_path', ...])` 실행
+        3. 반환 코드(returncode)로 성공/실패 판단
         """
         blog_cfg = BLOGS.get(blog_key)
         if not blog_cfg:
@@ -53,22 +54,48 @@ class DeployAgent(BaseAgent):
         if not blog_cfg.get("naver_id") or not blog_cfg.get("blog_id"):
             return {"success": False, "attempts": 0, "message": "블로그 자격증명 미설정 (.env 확인)"}
 
+        # 1. 임시 draft 파일 생성
+        draft_path = save_post_locally(title, content_html, tags, category, blog_cfg, sections=sections)
+        if not draft_path:
+            return {"success": False, "attempts": 0, "message": "draft 파일 저장 실패"}
+        logger.info(f"[DeployAgent] 임시 draft 생성: {draft_path}")
+
         last_error = "알 수 없는 오류"
-        blog_name  = blog_cfg["name"]
+        blog_name = blog_cfg["name"]
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 logger.info(
-                    f"[DeployAgent] [{blog_name}] 게시 시도 {attempt}/{MAX_RETRIES}: {title[:40]}"
+                    f"[DeployAgent] [{blog_name}] 게시 시도 {attempt}/{MAX_RETRIES} (외부 프로세스): {title[:40]}"
                 )
-                success = post_blog(title, content_html, tags, category, blog_cfg)
 
-                if success:
-                    logger.info(f"[DeployAgent] ✅ 게시 성공 (시도 {attempt}회): {title[:40]}")
+                # 2. subprocess로 외부 스크립트 실행
+                # sys.executable은 현재 실행 중인 파이썬 인터프리터를 가리킴
+                process = subprocess.run(
+                    [sys.executable, "run_single_post_html.py", "--draft", draft_path],
+                    capture_output=True,
+                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))), # workflow 폴더
+                    timeout=600
+                )
+
+                # stdout/stderr 디코딩 (run_single_post.py는 utf-8 출력)
+                stdout = process.stdout.decode("utf-8", errors="replace")
+                stderr = process.stderr.decode("utf-8", errors="replace")
+
+                if stdout:
+                    logger.info(f"[run_single_post_html.py stdout]\n{stdout}")
+                if stderr:
+                    logger.warning(f"[naver_poster.py stderr]\n{stderr}")
+
+                if process.returncode == 0:
+                    logger.info(f"[DeployAgent] ✅ 게시 성공 (시도 {attempt}회, exit 0): {title[:40]}")
                     return {"success": True, "attempts": attempt, "message": "게시 완료"}
+                
+                last_error = f"naver_poster.py가 exit code {process.returncode}로 실패했습니다.\n오류: {stderr}"
 
-                last_error = "post_blog 반환값 False (로그인 실패 또는 UI 변경 가능성)"
-
+            except subprocess.TimeoutExpired:
+                last_error = "naver_poster.py 실행 시간 초과 (10분)"
+                logger.error(f"[DeployAgent] 시도 {attempt} 시간 초과")
             except Exception as e:
                 last_error = str(e)
                 logger.error(f"[DeployAgent] 시도 {attempt} 예외: {e}")
@@ -80,7 +107,7 @@ class DeployAgent(BaseAgent):
 
         # ── 3회 모두 실패 ──────────────────────────────────
         logger.error(f"[DeployAgent] ❌ {MAX_RETRIES}회 모두 실패: {title[:40]}")
-        save_post_locally(title, content_html, tags, category, blog_cfg)
+        # 임시 파일은 이미 저장되어 있으므로 추가 저장 호출 필요 없음
         self._alert_failure(blog_name, title, category, last_error)
 
         return {
@@ -88,6 +115,7 @@ class DeployAgent(BaseAgent):
             "attempts": MAX_RETRIES,
             "message": f"3회 실패. drafts/ 폴더에 저장됨. 마지막 오류: {last_error}",
         }
+
 
     # ── Gmail 실패 알림 ──────────────────────────────────────────
     def _alert_failure(self, blog_name: str, title: str, category: str, error: str):

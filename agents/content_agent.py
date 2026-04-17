@@ -3,7 +3,7 @@
 기사를 깊이 있는 블로그 콘텐츠(구조화된 정보)로 변환
 모델: Nous Hermes 405B → Llama 3.3 70B → Gemma 3 27B (폴백 순서)
 """
-from typing import Optional, Union, List
+from typing import Optional
 import logging
 import sys
 import os
@@ -13,7 +13,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.base_agent import BaseAgent, HERMES_405B, NEMOTRON_120B, GPT_OSS_120B, QWEN3_80B, LLAMA_70B, MINIMAX, MISTRAL_24B, GEMMA_27B, DOLPHIN_24B
 from config import CATEGORIES
-from content_writer import CATEGORY_SEO
 
 logger = logging.getLogger(__name__)
 
@@ -22,128 +21,132 @@ class ContentAgent(BaseAgent):
     """블로그 콘텐츠 작성 전문 에이전트 (Hermes 405B 메인)"""
 
     def __init__(self):
-        # 콘텐츠 품질 최우선 → 대형 모델 우선
         super().__init__(
             model=HERMES_405B,
             fallback_models=[NEMOTRON_120B, GPT_OSS_120B, QWEN3_80B, LLAMA_70B, MINIMAX, MISTRAL_24B, GEMMA_27B, DOLPHIN_24B],
         )
 
-    def generate(self, articles: Union[dict, List[dict]], category: str) -> Optional[dict]:
-        """
-        여러 기사를 종합해 구조화된 블로그 콘텐츠 데이터로 변환.
-        같은 날 같은 주제 기사 3~5개를 합쳐 각 기사보다 풍부한 정보를 제공한다.
+    def generate(self, research_data: dict, category: str, content_type: str = "뉴스 분석") -> Optional[dict]:
+        """기사 1개를 중심으로 읽고 싶은 블로그 글 생성."""
+        main_topic_info = research_data.get("main_topic_info", [])
+        sub_topics      = research_data.get("sub_topics", {})
 
-        Args:
-            articles: 단일 기사 dict 또는 기사 list (여러 개 권장)
-            category: 카테고리명
+        if not main_topic_info:
+            logger.error("[ContentAgent] 생성 실패: 핵심 주제 정보가 없습니다.")
+            return None
 
-        Returns:
-            {title, title_alt, hook, main_points, comparison_data,
-             conclusion, checklist, tags_ko, tags_en}
-        """
-        # 단일 dict도 리스트로 통일
-        if isinstance(articles, dict):
-            articles = [articles]
+        today = date.today().strftime("%Y년 %m월 %d일")
 
-        seo     = CATEGORY_SEO.get(category, {})
-        cat_cfg = CATEGORIES.get(category, {})
+        core_article = main_topic_info[0]
+        core_block = (
+            f"[핵심 기사]\n"
+            f"제목: {core_article.get('title', '')}\n"
+            f"내용: {core_article.get('content') or core_article.get('summary', '')}"
+        )[:1200]
 
-        core_kw   = ", ".join(seo.get("core", [])[:4])
-        tail_kw   = ", ".join(seo.get("long_tail", [])[:3])
-        trend_kw  = ", ".join(seo.get("trending", [])[:3])
-        base_tags = cat_cfg.get("tags", [])[:6]
+        sub_info_lines = []
+        for sub_cat, articles in sub_topics.items():
+            for a in articles[:2]:
+                sub_info_lines.append(f"[{sub_cat}] {a.get('title', '')}: {(a.get('summary') or '')[:150]}")
+        sub_block = "[참고 정보]\n" + "\n".join(sub_info_lines) if sub_info_lines else ""
 
-        # 배경 정보 조합 — "기사" 표현 없이 주제·내용만 추출
-        info_block = ""
-        for a in articles[:5]:
-            title   = a.get("title", "").strip()
-            summary = a.get("summary", "").strip()
-            body    = a.get("content", "").strip()[:1200]
-            if title:
-                info_block += f"\n[정보]\n주제: {title}\n내용: {summary}\n{body}\n"
+        system_prompt = f"""당신은 네이버 블로그 전문 작가입니다.
+오늘({today}) 기준으로 실제 독자 1명에게 카카오톡 메시지 보내듯 씁니다.
 
-        n = len(articles)
+[절대 금지 — 이 문장 패턴이 나오면 즉시 다시 써야 합니다]
+- "~할 수 있습니다" → "~해요" 또는 "~됩니다"로
+- "~하는 것이 중요합니다" → "이게 핵심이에요"로
+- "살펴보겠습니다" → 그냥 바로 내용 시작
+- "정리합니다" → 금지
+- "파악할 수 있습니다" → 금지
+- "실현합니다" → 금지
+- 보고서처럼 들리는 문장 → 전부 금지
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "당신은 여행/생활정보 전문 블로거입니다.\n"
-                    "독자에게 직접 경험과 지식을 전하는 글을 씁니다.\n"
-                    "【절대 규칙】\n"
-                    "1. '기사', '출처', '보도', '링크', '원본' 등 언급 금지 — 내가 아는 정보로 쓸 것\n"
-                    "2. 한 글 = 한 질문 (주제 혼합 금지)\n"
-                    "3. 핵심 포인트 최대 3개\n"
-                    "4. 타깃 독자 1명 명확히\n"
-                    "5. 과장 수치 금지 — '87%', '절대 안 알려주는' 금지\n"
-                    "6. 제공된 배경 정보를 내 지식으로 녹여 쓸 것 (복사 금지)"
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"""다음 배경 정보를 참고해 네이버 블로그 글을 써주세요.
-이 블로그는 직접 경험·정보를 공유하는 채널입니다. 기사 냄새 없이 전문가의 언어로 작성하세요.
+[반드시 지켜야 할 말투 예시]
+나쁜 예: "이를 미리 체크하면 현지에서 불편을 줄일 수 있습니다."
+좋은 예: "미리 체크해두면 현지에서 당황할 일이 없어요."
 
-━━ 배경 정보 ━━
-{info_block}
+나쁜 예: "세미패키지는 항공·숙소는 사전 예약하고 현지 일정을 자유롭게 선택할 수 있는 형태입니다."
+좋은 예: "쉽게 말하면 비행기랑 호텔만 미리 잡고, 나머지는 현지에서 알아서 하는 거예요."
 
-━━ SEO 키워드 ━━
-핵심: {core_kw} | 롱테일: {tail_kw} | 트렌딩: {trend_kw}
-카테고리: {category.replace('_', '/')} | 날짜: {date.today().strftime('%Y년 %m월 %d일')}
+나쁜 예: "독자는 패키지의 특징을 한눈에 파악할 수 있습니다."
+좋은 예: "이 글 읽으면 5분 안에 다 이해돼요."
 
-━━ 작성 요건 ━━
+[도입부 규칙]
+반드시 아래 셋 중 하나로 시작:
+- 공감형: "혹시 이런 경험 있으세요?"
+- 반전형: "사실 대부분이 반대로 알고 있어요."
+- 직진형: "결론부터 말할게요."
+절대로 "이 글에서는..." "본 포스팅은..." 같은 메타 설명으로 시작하지 마세요.
 
-[주제]
-배경 정보에서 독자가 가장 궁금해할 질문 1개만 골라라.
-예) "유류할증료 올랐는데, 지금 항공권 사는 게 맞을까?" → 이 질문 하나에만 집중
+[링크 문장 규칙]
+링크([텍스트](url)) 뒤에 오는 문장은 반드시 짧고 자연스럽게 끝내세요.
+- 나쁜 예: "자세한 내용은 [고용24](url)에서 확인할 수 있습니다."
+- 좋은 예: "자세한 내용은 [고용24](url)에서 확인해보세요."
+- 나쁜 예: "[기관명](url)에서 알아볼 수 있습니다."
+- 좋은 예: "[기관명](url)에서 바로 보세요."
+링크 뒤에 "확인할 수 있습니다", "알아볼 수 있습니다", "파악할 수 있습니다" 절대 금지.
 
-[타깃 독자]
-구체적으로 1명 설정 (예: "연 1~2회 여행하는 30대 직장인")
+[구조 규칙]
+- sections는 3~4개
+- 각 section body는 2~3문장, 짧고 명확하게
+- compare_items는 표로 만들 내용이 있을 때만 사용
+- conclusion은 독자가 지금 당장 할 수 있는 행동 1가지로 끝내기
+"""
 
-[구조]
-1. 제목: 이모지 포함, 직관적 (30~40자)
-   금지) "90%가 모르는", "절대 안 알려주는" 낚시 표현
-2. 훅: 독자 공감 2문장 + 이 글이 답하는 질문 1문장
-3. 핵심 포인트 3개 MAX
-   - 소제목 + 설명 3~4문장 + 독자가 즉시 할 수 있는 행동 1가지
-4. 비교표 (선택)
-5. 결론 한 문장 + 즉시 실행 체크리스트 3가지
+        user_prompt = f"""아래 기사를 바탕으로 '{content_type}' 형식의 블로그 글을 작성해주세요.
 
-참고 태그: {', '.join(base_tags)}
+{core_block}
 
-JSON으로만 반환:
+{sub_block}
+
+━━ JSON 출력 (유효한 JSON만, 다른 텍스트 없이) ━━
+
+```json
 {{
-  "title": "제목 (이모지 포함, 과장 없이 직관적)",
-  "title_alt": "대안 제목",
-  "target_reader": "타깃 독자 한 줄 설명",
-  "hook": "공감 2문장 + 이 글이 답하는 질문 1문장",
-  "main_points": [
+  "title": "이모지 1개 포함, 40자 이내 제목",
+  "intro": "도입부 2~3문장. 공감·의외 사실·문제 제기 중 하나로 시작.",
+  "sections": [
     {{
-      "heading": "소제목 (이모지 포함)",
-      "content": "설명 3~4문장 (구어체, 과장 수치 없이)",
-      "action": "독자가 지금 당장 할 수 있는 행동 1가지",
-      "box_type": "tip|info|warning"
+      "heading": "소제목 (번호 없이, 이모지 1개)",
+      "body": "본문 2~4문장. **굵게** 강조, [기관명](url) 링크 포함.",
+      "compare_items": [
+        {{"label": "항목명", "value": "내용"}}
+      ],
+      "needs_link": true,
+      "link_topic": "고용24",
+      "needs_image": true,
+      "image_hint": "english keywords 2-3 words"
     }}
   ],
-  "comparison_data": {{
-    "caption": "비교표 제목",
-    "headers": ["항목1", "항목2", "항목3"],
-    "rows": [["값1", "값2", "값3"]]
-  }},
-  "conclusion": "이 글의 핵심 한 문장 (이모지 포함)",
-  "checklist": ["지금 바로 할 행동1", "할 행동2", "할 행동3"],
-  "tags_ko": ["한국어태그1"],
-  "tags_en": ["EnglishTag1"]
-}}""",
-            },
+  "conclusion": "체크리스트 또는 행동 제안 또는 선택 기준 — 2~5줄",
+  "main_image_hint": "글 전체 주제 대표 이미지 영어 키워드 2~3단어",
+  "tags": ["태그1", "태그2", "태그3", "태그4", "태그5", "태그6", "태그7", "태그8", "태그9", "태그10"]
+}}
+```
+
+규칙:
+- sections는 3~5개
+- compare_items는 비교 정보가 없으면 빈 배열 []
+- needs_link가 false이면 link_topic은 빈 문자열
+- needs_image가 false이면 image_hint는 빈 문자열
+- 해시태그(#)는 tags 배열에만. intro·body·conclusion에 넣지 마세요.
+- 링크 사용 규칙:
+  금지: "[기관명](url)에서 확인할 수 있습니다" / "에서 볼 수 있습니다" / "에서 알아볼 수 있습니다"
+  허용: "[기관명](url)를 참고하세요" / "[기관명](url)를 확인해보세요" / "[기관명](url) 참조"
+  허용: "자세한 내용은 [고용24](url)를 참고하세요"
+  허용: "신청 조건은 [고용24](url)를 확인해보세요"
+  링크 뒤에 "~할 수 있습니다" 계열 문장 절대 금지."""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
         ]
+        result = self.chat_json(messages, max_tokens=8000)
 
-        result = self.chat_json(messages, max_tokens=7000)
+        if not (isinstance(result, dict) and result.get("title") and result.get("sections")):
+            logger.error(f"[ContentAgent] '{content_type}' 생성 실패 또는 필수 필드 누락")
+            return None
 
-        # 최소 검증
-        if isinstance(result, dict) and result.get("title"):
-            logger.info(f"[ContentAgent] 콘텐츠 생성 완료 (기사 {n}개 종합): {result['title'][:40]}")
-            return result
-
-        logger.error("[ContentAgent] 콘텐츠 생성 실패 또는 형식 오류")
-        return None
+        logger.info(f"[ContentAgent] '{content_type}' 완료: {result.get('title', '')[:50]}")
+        return result

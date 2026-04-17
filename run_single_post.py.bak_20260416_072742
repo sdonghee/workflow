@@ -1,0 +1,532 @@
+"""
+run_single_post.py
+------------------------------------------------------------------
+draft JSON 1개를 받아 네이버 블로그 1곳에 발행 완료.
+
+실행:
+  python run_single_post.py --draft drafts/info/20260407_084941_3.json
+
+성공 기준:
+  PostView.naver URL 리다이렉트 확인 (exit 0)
+  RabbitWrite.naver POST 캡처 추가 확인
+
+독립 파일 -- orchestrator, agents, naver_poster 호출 없음.
+------------------------------------------------------------------
+"""
+import argparse
+import asyncio
+import json
+import io
+import logging
+import os
+import re
+import sys
+from datetime import datetime
+
+# Windows cp949 콘솔에서 한글/이모지 출력 안전하게 처리
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+# ── 경로 설정
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _ROOT)
+
+from config import BLOGS
+from poster.blockers import (
+    clear_publish_blockers,
+    dismiss_help_panel,
+    dismiss_restore_popup,
+)
+
+# ── 로깅
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("single_post")
+
+SCREENSHOT_DIR = os.path.join(_ROOT, "screenshots", "single_post")
+
+
+# ==================================================================
+# 유틸
+# ==================================================================
+
+def _load_json(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _load_cookies(cookie_file: str):
+    if not os.path.exists(cookie_file):
+        return None
+    with open(cookie_file, encoding="utf-8") as f:
+        data = f.read().strip()
+    return json.loads(data) if data else None
+
+
+def _html_to_plain(html: str) -> str:
+    """HTML 태그 제거 후 plain text 반환 (keyboard.type 용)"""
+    text = html.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
+
+
+def _find_blog_key(blog_name: str) -> str | None:
+    """draft['blog'] (한국어 이름) -> BLOGS 딕셔너리 키 변환"""
+    for key, cfg in BLOGS.items():
+        if cfg.get("name") == blog_name:
+            return key
+    return None
+
+
+async def _shot(page, step: str, run_id: str):
+    dirpath = os.path.join(SCREENSHOT_DIR, run_id)
+    os.makedirs(dirpath, exist_ok=True)
+    path = os.path.join(dirpath, f"{step}.png")
+    try:
+        await page.screenshot(path=path)
+        log.info(f"  [shot] {path}")
+    except Exception as e:
+        log.warning(f"  [shot] 실패 ({step}): {e}")
+
+
+# ==================================================================
+# 발행 엔진
+# ==================================================================
+
+async def publish(draft_path: str) -> bool:
+    """
+    draft JSON -> 발행 완료.
+    성공: True / 실패: False
+    """
+
+    # ── 0. draft 로드 ──────────────────────────────────────────────
+    log.info(f"[0] draft 로드: {draft_path}")
+    try:
+        draft = _load_json(draft_path)
+    except FileNotFoundError:
+        log.error(f"  파일 없음: {draft_path}")
+        return False
+    except json.JSONDecodeError as e:
+        log.error(f"  JSON 파싱 실패: {e}")
+        return False
+
+    title        = draft.get("title", "")
+    content_html = draft.get("content_html", "")
+    tags         = draft.get("tags", "")
+    category     = draft.get("category", "")
+    blog_name    = draft.get("blog", "")
+
+    if not title or not content_html:
+        log.error("  draft에 title 또는 content_html 없음")
+        return False
+
+    # draft 'blog' 필드 = blog_config["name"] -> BLOGS 키 역탐색
+    blog_key = _find_blog_key(blog_name)
+    if not blog_key:
+        log.error(f"  blog_name '{blog_name}'에 해당하는 BLOGS 키 없음")
+        log.error(f"  등록된 블로그: {[v['name'] for v in BLOGS.values()]}")
+        return False
+
+    blog_cfg = BLOGS[blog_key]
+    blog_id  = blog_cfg["blog_id"]
+    naver_id = blog_cfg["naver_id"]
+
+    run_id    = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{blog_key}"
+    write_url = f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}"
+
+    log.info(f"  제목     : {title[:50]}")
+    log.info(f"  블로그   : {blog_name} ({blog_id})")
+    log.info(f"  카테고리 : {category}")
+    log.info(f"  본문     : {len(content_html):,} bytes")
+    log.info(f"  스크린샷 : screenshots/single_post/{run_id}/")
+
+    # POST 요청 캡처 (RabbitWrite 확인용)
+    _captured_posts: list[str] = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="ko-KR",
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+        )
+
+        page = await context.new_page()
+
+        # 다이얼로그 처리 (beforeunload = accept, 나머지 = dismiss)
+        page.on(
+            "dialog",
+            lambda d: asyncio.ensure_future(
+                d.accept() if d.type == "beforeunload" else d.dismiss()
+            ),
+        )
+
+        # POST 요청 캡처 리스너
+        def _on_request(req):
+            if req.method == "POST":
+                _captured_posts.append(req.url)
+                log.info(f"  [POST] {req.url}")
+
+        page.on("request", _on_request)
+
+        try:
+            # ── 1. 쿠키 로그인 ──────────────────────────────────────
+            log.info(f"\n[1] 쿠키 로그인 확인")
+            cookies = _load_cookies(blog_cfg["cookie_file"])
+            if not cookies:
+                log.error(f"  쿠키 파일 없음: {blog_cfg['cookie_file']}")
+                log.error("  -> first_login.py 실행 후 재시도")
+                await browser.close()
+                return False
+
+            await context.add_cookies(cookies)
+            log.info(f"  {len(cookies)}개 쿠키 로드")
+
+            await page.goto("https://www.naver.com", wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(1500)
+            page_src = await page.content()
+            if naver_id.lower() not in page_src.lower() and "logout" not in page_src.lower():
+                log.error("  로그인 확인 실패 -- 쿠키 만료 가능성")
+                log.error("  -> first_login.py 실행 후 재시도")
+                await browser.close()
+                return False
+            log.info("  로그인 확인 완료")
+
+            # ── 2. 글쓰기 페이지 진입 ────────────────────────────────
+            log.info(f"\n[2] 글쓰기 페이지 진입")
+            log.info(f"  -> {write_url}")
+            await page.goto(write_url, wait_until="domcontentloaded", timeout=25000)
+            await page.wait_for_timeout(8000)   # SmartEditor 초기화 대기
+
+            if "nidlogin" in page.url or "login" in page.url.lower():
+                log.error(f"  로그인 페이지 리다이렉트: {page.url}")
+                await _shot(page, "02_FAIL_login_redirect", run_id)
+                await browser.close()
+                return False
+
+            # SmartEditor 로드 확인
+            editor_ok = await page.evaluate("""
+                () => !!(
+                    document.querySelector('.se-title-text') ||
+                    document.querySelector('.se-placeholder') ||
+                    document.querySelector('[class*="se-title"]')
+                )
+            """)
+            if not editor_ok:
+                log.error("  SmartEditor 로드 실패 -- .se-title-text / .se-placeholder 없음")
+                await _shot(page, "02_FAIL_editor_not_loaded", run_id)
+                await browser.close()
+                return False
+            log.info(f"  SmartEditor 로드 완료: {page.url[:80]}")
+            await _shot(page, "02_write_page", run_id)
+
+            # ── 3. blockers 제거 (팝업 + 도움말) ────────────────────
+            log.info("\n[3] blockers 제거")
+
+            # SmartEditor 완전 초기화 대기 (제목/본문 영역 실제 DOM 생성 후)
+            log.info("  SmartEditor 본문 영역 대기 중...")
+            for _wait_sel in [
+                ".se-title-text",
+                ".se-placeholder",
+                '[class*="se-document"]',
+            ]:
+                try:
+                    await page.locator(_wait_sel).first.wait_for(
+                        state="attached", timeout=10000
+                    )
+                    log.info(f"  SmartEditor 준비 완료 ({_wait_sel})")
+                    break
+                except Exception:
+                    continue
+            await page.wait_for_timeout(1000)   # React hydration 여유
+
+            r = await dismiss_restore_popup(page)
+            log.info(f"  restore popup: {r['action']} / {r['detail']}")
+            if not r["ok"]:
+                log.warning("  팝업 제거 실패 -- 계속 진행")
+
+            r = await dismiss_help_panel(page)
+            log.info(f"  help panel: {r['action']} / {r['detail']}")
+            if not r["ok"]:
+                log.warning("  도움말 패널 제거 실패 -- 계속 진행")
+
+            # SmartEditor 에디터 영역 visible 대기 (팝업 닫힘 후 React 리렌더링)
+            log.info("  에디터 visible 대기 중...")
+            for _vis_sel in [".se-title-text", ".se-placeholder"]:
+                try:
+                    await page.locator(_vis_sel).first.wait_for(
+                        state="visible", timeout=12000
+                    )
+                    log.info(f"  에디터 visible 확인 ({_vis_sel})")
+                    break
+                except Exception:
+                    continue
+            await page.wait_for_timeout(800)
+
+            await _shot(page, "03_after_blockers", run_id)
+
+            # ── 4. 제목 입력 ────────────────────────────────────────
+            log.info(f"\n[4] 제목 입력: {title[:40]}")
+            title_entered = False
+            for sel in [".se-title-text", ".se-title-input",
+                        'div[contenteditable="true"][class*="title"]']:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0:
+                        await loc.click(timeout=5000)
+                        await page.keyboard.press("Control+a")
+                        await page.keyboard.type(title, delay=40)
+                        log.info(f"  입력 완료 (selector: {sel})")
+                        title_entered = True
+                        break
+                except Exception:
+                    continue
+
+            if not title_entered:
+                log.error("  제목 입력 실패 -- 모든 selector 미매칭")
+                await _shot(page, "04_FAIL_title", run_id)
+                await browser.close()
+                return False
+
+            await page.wait_for_timeout(800)
+            await _shot(page, "04_after_title", run_id)
+
+            # ── 5. 본문 입력 (keyboard.type) ────────────────────────
+            log.info("\n[5] 본문 입력")
+            plain_text = _html_to_plain(content_html)
+            if tags:
+                tag_line = " ".join(f"#{t.strip()}" for t in tags.split(",") if t.strip())[:200]
+                plain_text = plain_text + "\n\n" + tag_line
+
+            log.info(f"  plain text {len(plain_text):,}자 준비")
+
+            # .se-placeholder Playwright locator click -> SmartEditor 이벤트 발생
+            body_focused = False
+            for sel in [".se-placeholder", ".se-component:not(.se-component-title)"]:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0:
+                        await loc.click(timeout=5000)
+                        await page.wait_for_timeout(500)
+                        log.info(f"  본문 포커스 ({sel})")
+                        body_focused = True
+                        break
+                except Exception:
+                    continue
+
+            if not body_focused:
+                # 좌표 클릭 폴백 (에디터 중앙)
+                await page.mouse.click(640, 450)
+                await page.wait_for_timeout(500)
+                log.warning("  본문 selector 실패 -- 좌표 클릭 (640, 450) 폴백")
+
+            # 최대 3,000자 타이핑 (5ms/자)
+            await page.keyboard.type(plain_text[:3000], delay=5)
+            await page.wait_for_timeout(800)
+
+            # 입력 확인: placeholder 사라짐 or body 텍스트 증가
+            placeholder_gone = await page.evaluate("""
+                () => {
+                    var ph = document.querySelector('.se-placeholder');
+                    return !ph || ph.style.display === 'none' || ph.offsetParent === null;
+                }
+            """)
+            body_len = await page.evaluate("document.body.innerText.trim().length")
+            log.info(f"  placeholder_gone={placeholder_gone}, body_len={body_len}")
+
+            if not placeholder_gone and body_len < 200:
+                log.error("  본문 입력 실패 -- SmartEditor 상태 업데이트 없음")
+                await _shot(page, "05_FAIL_content", run_id)
+                await browser.close()
+                return False
+
+            log.info(f"  본문 입력 완료 (body={body_len}자)")
+            await _shot(page, "05_after_content", run_id)
+
+            # ── 6. 발행 패널 열기 (1차 버튼) ────────────────────────
+            log.info("\n[6] 1차 발행 버튼 클릭 (패널 열기)")
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(400)
+
+            open_cls = await page.evaluate("""
+                () => {
+                    var btn = Array.from(document.querySelectorAll('button[class*="publish_btn"]'))
+                        .find(b =>
+                            !b.className.includes('publish_btn_area') &&
+                            b.getBoundingClientRect().width > 0
+                        );
+                    if (!btn) {
+                        btn = Array.from(document.querySelectorAll('button')).find(b =>
+                            b.textContent.trim() === '발행' &&
+                            b.getBoundingClientRect().width > 0
+                        );
+                    }
+                    if (btn) { btn.click(); return btn.className; }
+                    return null;
+                }
+            """)
+
+            if not open_cls:
+                log.error("  발행 버튼을 DOM에서 찾지 못함 (publish_btn__*)")
+                await _shot(page, "06_FAIL_publish_btn", run_id)
+                await browser.close()
+                return False
+
+            log.info(f"  클릭 완료: {open_cls[:60]}")
+            await page.wait_for_timeout(2500)   # 패널 애니메이션
+            await _shot(page, "06_panel_open", run_id)
+
+            # ── 7. confirm 버튼 클릭 (최종 발행) ────────────────────
+            log.info("\n[7] 최종 발행 버튼 (confirm) 클릭")
+
+            r = await clear_publish_blockers(page)
+            log.info(f"  publish blockers: {r['action']} / {r['detail']}")
+
+            confirm_clicked = False
+
+            # A. Playwright locator -- confirm_btn 클래스 (real pointer event)
+            for sel in ["[class*='confirm_btn']", "[class*='confirmBtn']",
+                        "[class*='publish_confirm']"]:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() == 0:
+                        continue
+                    cls = await loc.get_attribute("class") or ""
+                    # 패널 열기 버튼(publish_btn__)은 건너뜀
+                    if "publish_btn__" in cls and "confirm" not in cls:
+                        continue
+                    await loc.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(200)
+                    await loc.click(timeout=5000)
+                    log.info(f"  Playwright 클릭: {cls[:60]}")
+                    confirm_clicked = True
+                    break
+                except Exception as e:
+                    log.debug(f"  selector 실패 ({sel}): {e}")
+
+            # B. JS .click() 폴백
+            if not confirm_clicked:
+                log.warning("  locator 실패 -> JS .click() 폴백")
+                fallback = await page.evaluate("""
+                    () => {
+                        var btn = Array.from(document.querySelectorAll('button')).find(b => {
+                            var cls = b.className;
+                            var r = b.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0
+                                && (cls.includes('confirm_btn') || cls.includes('confirmBtn'))
+                                && !cls.includes('publish_btn__');
+                        });
+                        if (!btn) {
+                            btn = Array.from(document.querySelectorAll('button')).find(b => {
+                                var r = b.getBoundingClientRect();
+                                return b.textContent.trim() === '발행'
+                                    && !b.className.includes('publish_btn__')
+                                    && !b.className.includes('fold')
+                                    && r.width >= 30 && r.height >= 20;
+                            });
+                        }
+                        if (btn) { btn.click(); return btn.className; }
+                        return null;
+                    }
+                """)
+                if fallback:
+                    log.info(f"  JS .click(): {fallback[:60]}")
+                    confirm_clicked = True
+                else:
+                    log.error("  confirm 버튼을 찾지 못함 -- 발행 패널 구조 변경 가능성")
+                    await _shot(page, "07_FAIL_confirm", run_id)
+                    await browser.close()
+                    return False
+
+            # ── 8. PostView 리다이렉트 대기 ──────────────────────────
+            log.info("\n[8] PostView 리다이렉트 대기 (최대 25초)")
+            postview_ok = False
+            try:
+                await page.wait_for_url("**/PostView.naver**", timeout=25000)
+                log.info(f"  PostView 도달: {page.url}")
+                postview_ok = True
+            except PWTimeout:
+                log.warning(f"  25초 내 PostView 미도달 (현재: {page.url[:80]})")
+                await page.wait_for_timeout(2000)
+
+            await _shot(page, "08_after_confirm", run_id)
+
+            # ── 9. 성공 판정 ─────────────────────────────────────────
+            log.info("\n[9] 성공 판정")
+            page.remove_listener("request", _on_request)
+
+            rabbit_ok    = any("RabbitWrite" in u for u in _captured_posts)
+            postview_url = "PostView" in page.url
+
+            log.info(f"  PostView URL  : {postview_url} ({page.url[:80]})")
+            log.info(f"  RabbitWrite   : {rabbit_ok}")
+            log.info(f"  캡처된 POSTs  : {len(_captured_posts)}건")
+            for u in _captured_posts:
+                log.info(f"    - {u}")
+
+            success = postview_url or rabbit_ok
+
+        except Exception as e:
+            log.error(f"[!] 예외 발생: {e}", exc_info=True)
+            await _shot(page, "99_exception", run_id)
+            success = False
+
+        finally:
+            await browser.close()
+
+    # ── 결과 출력 ─────────────────────────────────────────────────
+    log.info("\n" + "=" * 60)
+    if success:
+        log.info("[OK] 발행 성공")
+        log.info(f"     제목: {title[:50]}")
+        log.info(f"     URL : {page.url[:100]}")
+    else:
+        log.error("[FAIL] 발행 실패")
+        log.error(f"  스크린샷: screenshots/single_post/{run_id}/")
+        log.error("  로그 위에서 첫 번째 FAIL/ERROR 항목을 확인하세요.")
+    log.info("=" * 60)
+
+    return success
+
+
+# ==================================================================
+# 진입점
+# ==================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Naver 블로그 단건 발행")
+    parser.add_argument(
+        "--draft",
+        required=True,
+        help="발행할 draft JSON 파일 경로 (예: drafts/info/20260407_084941_3.json)",
+    )
+    args = parser.parse_args()
+
+    # 절대 경로 변환
+    draft_path = args.draft
+    if not os.path.isabs(draft_path):
+        draft_path = os.path.join(_ROOT, draft_path)
+
+    ok = asyncio.run(publish(draft_path))
+    sys.exit(0 if ok else 1)

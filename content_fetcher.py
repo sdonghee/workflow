@@ -100,7 +100,7 @@ def fetch_rss_articles(rss_url, max_articles=5):
 
 
 def fetch_web_content(url, max_chars=3000):
-    """웹 페이지 본문 내용 추출"""
+    """[수정됨] 웹 페이지 본문 추출 + 일본어 포함 시 즉시 폐기"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -113,16 +113,21 @@ def fetch_web_content(url, max_chars=3000):
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "ad"]):
             tag.decompose()
 
-        # 본문 추출 (article, main, content 등)
+        # 본문 추출
         content = ""
+        # ... (기존 본문 추출 로직)
         for selector in ["article", "main", ".content", "#content", ".article-body", ".news-body"]:
             element = soup.select_one(selector)
             if element:
                 content = element.get_text(separator="\n", strip=True)
                 break
-
         if not content:
             content = soup.get_text(separator="\n", strip=True)
+
+        # [핵심 개선] 일본어 포함 여부 검사
+        if re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', content):
+            logger.warning(f"일본어가 포함되어 기사를 폐기합니다: {url}")
+            return "" # 일본어 포함 시, 빈 문자열 반환
 
         # 너무 짧은 줄 제거
         lines = [line.strip() for line in content.split("\n") if len(line.strip()) > 20]
@@ -181,11 +186,19 @@ def search_naver_news(query, display=5):
 
 
 def search_google_news(query, num=5):
-    """구글 뉴스 RSS 검색"""
+    """[수정됨] 구글 뉴스 RSS 검색 (한국 사이트 우선)"""
     articles = []
     try:
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=ko&gl=KR&ceid=KR:ko"
+        # 한국 .kr, .co.kr 도메인 우선 검색
+        korean_preferred_query = f'{query} site:.kr OR site:.co.kr'
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(korean_preferred_query)}&hl=ko&gl=KR&ceid=KR:ko"
         articles = fetch_rss_articles(url, max_articles=num)
+        # 결과가 없으면 원래 쿼리로 재시도
+        if not articles:
+            logger.info(f"'{korean_preferred_query}' 결과 없음. 일반 검색으로 재시도.")
+            url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=ko&gl=KR&ceid=KR:ko"
+            articles = fetch_rss_articles(url, max_articles=num)
+        
         for a in articles:
             a["source"] = "google_news"
         logger.info(f"구글 뉴스 '{query}'에서 {len(articles)}개 기사 수집")
@@ -195,12 +208,21 @@ def search_google_news(query, num=5):
 
 
 def search_google_news_today(query, num=5):
-    """구글 뉴스 RSS — 당일(24시간 이내) 기사만 검색"""
+    """[수정됨] 구글 뉴스 RSS — 당일(24시간 이내) 기사만 검색 (한국 사이트 우선)"""
     articles = []
     try:
-        today_query = f"{query} when:1d"
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(today_query)}&hl=ko&gl=KR&ceid=KR:ko"
+        # 한국 .kr, .co.kr 도메인 우선 검색
+        korean_preferred_query = f'"{query}" site:.kr OR site:.co.kr when:1d'
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(korean_preferred_query)}&hl=ko&gl=KR&ceid=KR:ko"
         articles = fetch_rss_articles(url, max_articles=num)
+
+        # 결과가 없으면 원래 쿼리로 재시도
+        if not articles:
+            logger.info(f"'{korean_preferred_query}' 결과 없음. 일반 검색으로 재시도.")
+            today_query = f"{query} when:1d"
+            url = f"https://news.google.com/rss/search?q={requests.utils.quote(today_query)}&hl=ko&gl=KR&ceid=KR:ko"
+            articles = fetch_rss_articles(url, max_articles=num)
+
         for a in articles:
             a["source"] = "google_news_today"
         logger.info(f"구글 뉴스(당일) '{query}'에서 {len(articles)}개 기사 수집")

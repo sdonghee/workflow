@@ -1,6 +1,6 @@
 """
-스케줄러 - 하루 2회 자동 포스팅 실행
-오전 06:00 (1회차) + 낮 12:00 (2회차)
+스케줄러 - 하루 4회 자동 포스팅 실행
+09:00 (1회차) + 12:00 (2회차) + 15:00 (3회차) + 18:00 (4회차)
 """
 import argparse
 import logging
@@ -9,7 +9,7 @@ from datetime import datetime
 import schedule
 import time
 
-from config import LOG_FILE, LOG_LEVEL, POST_START_HOUR, POST_START_HOUR_2
+from config import LOG_FILE, LOG_LEVEL, POST_START_HOUR, POST_START_HOUR_2, POST_START_HOUR_3, POST_START_HOUR_4
 from orchestrator import run_orchestrator_session
 
 logging.basicConfig(
@@ -37,15 +37,19 @@ def scheduled_job(session_label: str = ""):
 
 
 def run_scheduler():
-    """데몬 모드: 매일 06:00 + 12:00 실행"""
+    """데몬 모드: 매일 09:00 + 12:00 + 15:00 + 18:00 실행"""
     t1 = f"{POST_START_HOUR:02d}:00"
     t2 = f"{POST_START_HOUR_2:02d}:00"
+    t3 = f"{POST_START_HOUR_3:02d}:00"
+    t4 = f"{POST_START_HOUR_4:02d}:00"
 
-    logger.info(f"스케줄러 시작 — 매일 {t1}(1회차), {t2}(2회차) 실행")
+    logger.info(f"스케줄러 시작 — 매일 {t1}(1회차), {t2}(2회차), {t3}(3회차), {t4}(4회차) 실행")
     logger.info("종료: Ctrl+C")
 
     schedule.every().day.at(t1).do(scheduled_job, session_label="오전 1회차")
     schedule.every().day.at(t2).do(scheduled_job, session_label="낮 2회차")
+    schedule.every().day.at(t3).do(scheduled_job, session_label="오후 3회차")
+    schedule.every().day.at(t4).do(scheduled_job, session_label="저녁 4회차")
 
     while True:
         schedule.run_pending()
@@ -63,23 +67,15 @@ if __name__ == "__main__":
         scheduled_job(session_label="즉시 실행")
 
     elif args.test:
-        logger.info("=== 테스트 모드 (게시 없음) ===")
-        from content_fetcher import collect_all_content
-        from content_writer import generate_blog_post
-        from image_finder import get_free_image_url
-
-        logger.info("콘텐츠 수집 중...")
-        all_content = collect_all_content()
-        for cat, data in all_content.items():
-            articles = data.get("articles", [])
-            logger.info(f"[{cat}] {len(articles)}개 기사 수집")
-            for art in articles[:1]:
-                logger.info(f"  기사: {art.get('title', '')[:60]}")
-                post = generate_blog_post(cat, art)
-                if post:
-                    logger.info(f"  생성 제목: {post.get('title', '')}")
-                    logger.info(f"  태그(hash): {post.get('tags_hash', '')[:60]}")
-        logger.info("테스트 완료")
+        logger.info("=== 테스트 모드 (orchestrator 파이프라인) ===")
+        logger.info("첫 번째 포스트만 생성 및 발행...")
+        from orchestrator import run_single_post_via_orchestrator
+        result = run_single_post_via_orchestrator()
+        logger.info(f"테스트 완료: {result}")
+        if result.get("success"):
+            logger.info(f"✅ 성공: {result.get('title', '')}")
+        else:
+            logger.warning(f"❌ 실패")
 
     else:
         run_scheduler()

@@ -14,4 +14,4 @@ RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host pypi.pytho
 
 COPY . .
 
-CMD ["python", "scheduler.py"]
+CMD ["xvfb-run", "-a", "python", "scheduler.py"]

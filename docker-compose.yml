@@ -17,4 +17,4 @@ services:
       - ./screenshots:/app/screenshots
     environment:
       - HEADLESS=true
-    shm_size: '256mb'
+    shm_size: '2gb'

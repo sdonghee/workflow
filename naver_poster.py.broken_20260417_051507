@@ -1,0 +1,1213 @@
+﻿"""
+?ㅼ씠踰?釉붾줈洹??먮룞 ?ъ뒪??紐⑤뱢
+- 荑좏궎 ???諛⑹떇?쇰줈 罹≪감 ?놁씠 ?덉젙?곸쑝濡?濡쒓렇??- 泥섏쓬 ??踰덈쭔 ?섎룞 濡쒓렇?????댄썑 ?먮룞?쇰줈 荑좏궎 ?ъ슜
+- 硫??釉붾줈洹?吏?? blog_config ?뺤뀛?덈━濡?怨꾩젙 ?꾨떖
+"""
+import asyncio
+import logging
+import json
+import os
+import subprocess
+import time
+import urllib.parse
+from datetime import datetime
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from config import HEADLESS
+
+SCREENSHOT_DIR = "/app/screenshots"
+
+logger = logging.getLogger(__name__)
+
+# ?????????????????????????????????????????
+# Xvfb 媛???붿뒪?뚮젅??(Docker ?대┰蹂대뱶 吏??
+# ?????????????????????????????????????????
+
+_xvfb_proc = None
+
+
+def _ensure_xvfb() -> bool:
+    """Xvfb 媛??X11 ?붿뒪?뚮젅???쒖옉 (?놁쑝硫?headless ?좎?)
+
+    SmartEditor ONE? ?ㅼ젣 ?쒖뒪???대┰蹂대뱶 Ctrl+V留??덉슜.
+    Docker headless ?섍꼍?먯꽌??X11 ?붿뒪?뚮젅???놁씠 xclip 遺덇? ??Xvfb濡??닿껐.
+    """
+    global _xvfb_proc
+    if os.environ.get("DISPLAY"):
+        logger.info(f"DISPLAY ?대? ?ㅼ젙: {os.environ['DISPLAY']}")
+        return True
+    try:
+        _xvfb_proc = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        time.sleep(1.5)  # Xvfb 珥덇린???湲?        logger.info("??Xvfb :99 ?쒖옉 ??DISPLAY=:99 (鍮꼑eadless 紐⑤뱶濡??꾪솚)")
+        return True
+    except FileNotFoundError:
+        logger.warning("Xvfb ?놁쓬 ??headless 紐⑤뱶 ?좎? (?대┰蹂대뱶 ?쒗븳)")
+        return False
+    except Exception as e:
+        logger.warning(f"Xvfb ?쒖옉 ?ㅽ뙣: {e}")
+        return False
+
+
+def _xclip_write(html: str) -> bool:
+    """HTML??X11 ?대┰蹂대뱶??? (xclip ?ъ슜)
+
+    xclip? ?ㅻⅨ ?꾨줈?몄뒪媛 ?대┰蹂대뱶瑜??붿껌???뚭퉴吏 ?ㅽ뻾 ?좎? (?곕が 諛⑹떇).
+    subprocess.run()?쇰줈 湲곕떎由щ㈃ ??꾩븘????Popen()?쇰줈 諛깃렇?쇱슫???ㅽ뻾?댁빞 ??
+    """
+    if not os.environ.get("DISPLAY"):
+        return False
+    try:
+        # Popen: stdin?쇰줈 ?곗씠???꾨떖 ??諛깃렇?쇱슫?쒖뿉???湲?        # xclip? Ctrl+V(clipboard ?붿껌)瑜?諛쏆쑝硫??곗씠???쒓났 ??醫낅즺
+        proc = subprocess.Popen(
+            ["xclip", "-selection", "clipboard", "-t", "text/html"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.stdin.write(html.encode("utf-8"))
+        proc.stdin.close()
+        # ?꾨즺 ?湲??놁쓬 - xclip???대┰蹂대뱶 ?붿껌??諛쏆쓣 ?뚭퉴吏 ?ㅽ뻾 ?좎?
+        time.sleep(0.3)  # xclip ?대┰蹂대뱶 ?뚯쑀沅??깅줉 ?湲?        logger.info(f"xclip text/html 諛깃렇?쇱슫???ㅽ뻾 ({len(html):,} bytes)")
+        return True
+    except FileNotFoundError:
+        logger.warning("xclip ?놁쓬")
+        return False
+    except Exception as e:
+        logger.warning(f"xclip ?덉쇅: {e}")
+        return False
+
+
+# ?????????????????????????????????????????
+# ?ㅽ겕由곗꺑 ????ы띁
+# ?????????????????????????????????????????
+
+async def _screenshot(page, step: str, run_id: str):
+    """?꾩옱 ?붾㈃??screenshots/{run_id}/{step}.png 濡????""
+    try:
+        dir_path = os.path.join(SCREENSHOT_DIR, run_id)
+        os.makedirs(dir_path, exist_ok=True)
+        path = os.path.join(dir_path, f"{step}.png")
+        await page.screenshot(path=path, full_page=False)
+        logger.info(f"[?ㅽ겕由곗꺑] {path}")
+    except Exception as e:
+        logger.warning(f"[?ㅽ겕由곗꺑 ?ㅽ뙣] {step}: {e}")
+
+
+# ?????????????????????????????????????????
+# 荑좏궎 ???/ 遺덈윭?ㅺ린
+# ?????????????????????????????????????????
+
+def save_cookies(cookies, cookie_file):
+    with open(cookie_file, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, ensure_ascii=False, indent=2)
+    logger.info(f"荑좏궎 ????꾨즺: {cookie_file}")
+
+
+def load_cookies(cookie_file):
+    if not os.path.exists(cookie_file):
+        return None
+    with open(cookie_file, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+        if not content:
+            return None
+        return json.loads(content)
+
+
+# ?????????????????????????????????????????
+# 濡쒓렇???곹깭 ?뺤씤
+# ?????????????????????????????????????????
+
+async def is_logged_in(page, naver_id):
+    """?꾩옱 ?ㅼ씠踰꾩뿉 濡쒓렇?몃릺???덈뒗吏 ?뺤씤"""
+    try:
+        await page.goto("https://www.naver.com", wait_until="domcontentloaded", timeout=15000)
+        await page.wait_for_timeout(2000)
+        content = await page.content()
+        return naver_id.lower() in content.lower() or "濡쒓렇?꾩썐" in content
+    except Exception:
+        return False
+
+
+# ?????????????????????????????????????????
+# 荑좏궎濡?濡쒓렇???쒕룄
+# ?????????????????????????????????????????
+
+async def login_with_cookies(context, page, blog_config):
+    """??λ맂 荑좏궎濡?濡쒓렇???쒕룄"""
+    cookies = load_cookies(blog_config["cookie_file"])
+    if not cookies:
+        logger.info(f"[{blog_config['name']}] ??λ맂 荑좏궎 ?놁쓬")
+        return False
+
+    try:
+        await context.add_cookies(cookies)
+        logged_in = await is_logged_in(page, blog_config["naver_id"])
+        if logged_in:
+            logger.info(f"[{blog_config['name']}] ??荑좏궎 濡쒓렇???깃났")
+            return True
+        else:
+            logger.info(f"[{blog_config['name']}] 荑좏궎媛 留뚮즺?섏뿀?듬땲?? ?щ줈洹몄씤 ?꾩슂")
+            return False
+    except Exception as e:
+        logger.error(f"[{blog_config['name']}] 荑좏궎 濡쒓렇???ㅽ뙣: {e}")
+        return False
+
+
+# ?????????????????????????????????????????
+# ?먮룞 濡쒓렇??(ID/PW)
+# ?????????????????????????????????????????
+
+async def login_with_password(page, blog_config):
+    """ID/PW濡?濡쒓렇??(荑좏궎 ?놁쓣 ???먮뒗 留뚮즺 ??"""
+    naver_id = blog_config["naver_id"]
+    naver_pw = blog_config["naver_pw"]
+    try:
+        await page.goto("https://nid.naver.com/nidlogin.login", wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+
+        await page.click("#id")
+        await page.wait_for_timeout(500)
+        for char in naver_id:
+            await page.type("#id", char, delay=80)
+        await page.wait_for_timeout(700)
+
+        await page.click("#pw")
+        await page.wait_for_timeout(500)
+        for char in naver_pw:
+            await page.type("#pw", char, delay=80)
+        await page.wait_for_timeout(700)
+
+        await page.click(".btn_login")
+        await page.wait_for_timeout(4000)
+
+        current_url = page.url
+        if "nidlogin" in current_url:
+            logger.error(f"[{blog_config['name']}] ??濡쒓렇???ㅽ뙣 - 罹≪감 ?먮뒗 怨꾩젙 ?ㅻ쪟. first_login.py 瑜??ㅽ뻾?섏꽭??)
+            return False
+
+        logger.info(f"[{blog_config['name']}] ??ID/PW 濡쒓렇???깃났")
+        return True
+
+    except Exception as e:
+        logger.error(f"[{blog_config['name']}] 濡쒓렇???ㅻ쪟: {e}")
+        return False
+
+
+# ?????????????????????????????????????????
+# 硫붿씤 ?ъ뒪???⑥닔
+# ?????????????????????????????????????????
+
+class BrowserUnavailableError(RuntimeError):
+    """?쒖뒪???쇱씠釉뚮윭由?遺議깆쑝濡?釉뚮씪?곗?瑜??ㅽ뻾?????놁쓣 ??""
+    pass
+
+
+def _is_missing_lib_error(e: Exception) -> bool:
+    msg = str(e)
+    return any(k in msg for k in ("shared libraries", "exitCode=127", "libatk", "libgtk", "exitCode=255", "libmoz"))
+
+
+async def _launch_browser(p):
+    """Chromium ??Firefox ?쒖쑝濡??쒕룄, ?????ㅽ뙣 ??BrowserUnavailableError
+
+    DISPLAY ?섍꼍蹂?섍? ?덉쑝硫?(Xvfb) headless=False 濡??ㅽ뻾 ???쒖뒪???대┰蹂대뱶 ?ъ슜 媛??    """
+    # Xvfb媛 ?덉쑝硫?headless=False (?ㅼ젣 X11 ?대┰蹂대뱶 ?ъ슜)
+    # ?놁쑝硫??ㅼ젙媛?HEADLESS) ?ъ슜
+    xvfb_active = bool(os.environ.get("DISPLAY"))
+    use_headless = False if xvfb_active else HEADLESS
+    logger.info(f"釉뚮씪?곗? headless={use_headless} (DISPLAY={os.environ.get('DISPLAY','?놁쓬')})")
+
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+    ]
+    # 1) Chromium
+    try:
+        browser = await p.chromium.launch(headless=use_headless, args=chromium_args)
+        logger.info("釉뚮씪?곗?: Chromium")
+        return browser, "chromium"
+    except Exception as e:
+        if not _is_missing_lib_error(e):
+            raise
+        logger.warning("Chromium ?쇱씠釉뚮윭由??놁쓬, Firefox ?쒕룄 以?..")
+
+    # 2) Firefox
+    try:
+        browser = await p.firefox.launch(
+            headless=HEADLESS,
+            firefox_user_prefs={
+                "network.captive-portal-service.enabled": False,
+                "browser.tabs.remote.autostart": False,
+            },
+        )
+        logger.info("釉뚮씪?곗?: Firefox")
+        return browser, "firefox"
+    except Exception as e:
+        logger.error(f"Firefox ?ㅽ뻾 ?ㅻ쪟 ?곸꽭: {e}")
+        if not _is_missing_lib_error(e):
+            raise
+        raise BrowserUnavailableError(
+            "Chromium/Firefox 紐⑤몢 ?ㅽ뻾 遺덇?. ?쒖뒪???쇱씠釉뚮윭由?遺議?\n"
+            f"Firefox ?ㅻ쪟: {e}"
+        ) from e
+
+
+async def post_to_naver_blog(title, content_html, tags, category, blog_config):
+    """
+    ?ㅼ씠踰?釉붾줈洹몄뿉 湲 ?ъ뒪??    blog_config: BLOGS dict??媛쒕퀎 釉붾줈洹??ㅼ젙
+    """
+    # Xvfb 媛???붿뒪?뚮젅???쒖옉 (Docker ?섍꼍?먯꽌 ?쒖뒪???대┰蹂대뱶 ?ъ슜 媛?ν븯寃?
+    _ensure_xvfb()
+
+    # ?ㅽ뻾留덈떎 怨좎쑀 ?대뜑???ㅽ겕由곗꺑 ???(?? 20260326_153012)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{blog_config.get('blog_id','')}"
+
+    async with async_playwright() as p:
+        browser, browser_type = await _launch_browser(p)
+
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=ua if browser_type == "chromium" else None,
+            locale="ko-KR",
+        )
+
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        """)
+
+        page = await context.new_page()
+
+        # 釉뚮씪?곗? ?ㅼ씠?쇰줈洹?泥섎━
+        # beforeunload = 諛쒗뻾 ???섏씠吏 ?댄깉 ??accept()濡??덉슜
+        # ?섎㉧吏(alert ?? = dismiss()濡??リ린
+        async def _on_dialog(dialog):
+            if dialog.type == "beforeunload":
+                logger.info("釉뚮씪?곗? ?ㅼ씠?쇰줈洹? [beforeunload] 諛쒗뻾 ???댄깉 ?덉슜")
+                await dialog.accept()
+            else:
+                logger.warning(f"釉뚮씪?곗? ?ㅼ씠?쇰줈洹? [{dialog.type}] {dialog.message}")
+                await dialog.dismiss()
+        page.on("dialog", _on_dialog)
+
+        try:
+            # 1. 荑좏궎濡?濡쒓렇???쒕룄
+            logged_in = await login_with_cookies(context, page, blog_config)
+
+            # 2. 荑좏궎 留뚮즺 ??ID/PW 濡쒓렇??            if not logged_in:
+                logged_in = await login_with_password(page, blog_config)
+                if not logged_in:
+                    return False
+                cookies = await context.cookies()
+                save_cookies(cookies, blog_config["cookie_file"])
+
+            # 3. 湲?곌린 ?섏씠吏 ?대룞
+            blog_id = blog_config["blog_id"]
+            write_url = f"https://blog.naver.com/{blog_id}?Redirect=Write&categoryNo=0"
+            await page.goto(write_url, wait_until="domcontentloaded")
+            await page.wait_for_timeout(5000)
+
+            if len(context.pages) > 1:
+                page = context.pages[-1]
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(3000)
+
+            logger.info(f"[{blog_config['name']}] 湲?곌린 ?섏씠吏: {page.url}")
+
+            # 荑좏궎 留뚮즺濡?濡쒓렇???섏씠吏濡?由щ떎?대젆?몃맂 寃쎌슦 ?щ줈洹몄씤
+            if "nidlogin" in page.url or ("naver.com" in page.url and "login" in page.url.lower()):
+                logger.warning(f"[{blog_config['name']}] 荑좏궎 留뚮즺 媛먯? (濡쒓렇???섏씠吏 由щ떎?대젆?? ??ID/PW ?щ줈洹몄씤")
+                logged_in = await login_with_password(page, blog_config)
+                if not logged_in:
+                    logger.error(f"[{blog_config['name']}] ID/PW ?щ줈洹몄씤 ?ㅽ뙣")
+                    return False
+                cookies = await context.cookies()
+                save_cookies(cookies, blog_config["cookie_file"])
+                await page.goto(write_url, wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+                if len(context.pages) > 1:
+                    page = context.pages[-1]
+                    await page.wait_for_load_state("domcontentloaded")
+                    await page.wait_for_timeout(3000)
+                logger.info(f"[{blog_config['name']}] ?щ줈洹몄씤 ??湲?곌린 ?섏씠吏: {page.url}")
+
+            # mainFrame 濡쒕뱶 ?湲?            try:
+                await page.wait_for_selector(
+                    "iframe[name='mainFrame'], iframe#mainFrame",
+                    timeout=15000
+                )
+                await page.wait_for_timeout(2000)
+            except Exception:
+                logger.warning("mainFrame iframe DOM 誘몃컻寃? 怨꾩냽 吏꾪뻾")
+
+            frame_info = [(f.name or "noname", f.url[:60]) for f in page.frames]
+            logger.info(f"濡쒕뱶??frames({len(frame_info)}媛?: {frame_info}")
+
+            main_frame = page.frame(name="mainFrame")
+            if main_frame:
+                try:
+                    await main_frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                    await page.wait_for_timeout(1000)
+                    logger.info(f"mainFrame 濡쒕뱶 ?꾨즺: {main_frame.url[:60]}")
+                except Exception:
+                    logger.warning("mainFrame 濡쒕뱶 ?湲??ㅽ뙣, 怨꾩냽 吏꾪뻾")
+
+                # ?섎せ??釉붾줈洹?由щ떎?대젆??媛먯? (荑좏궎???ㅻⅨ 怨꾩젙 ?뺣낫媛 ?덉쓣 ??
+                # ?? flighttravel?Redirect=Write ??PostList.naver?blogId=wiselife000
+                mf_url = main_frame.url if main_frame else ""
+                if "PostWriteForm" not in mf_url and "PostWrite" not in mf_url:
+                    logger.warning(f"[{blog_config['name']}] 湲?곌린 ???꾨땶 ?섏씠吏 媛먯?: {mf_url[:80]} ??ID/PW ?щ줈洹몄씤")
+                    logged_in = await login_with_password(page, blog_config)
+                    if not logged_in:
+                        logger.error(f"[{blog_config['name']}] ???щ줈洹몄씤 ?ㅽ뙣")
+                        return False
+                    cookies = await context.cookies()
+                    save_cookies(cookies, blog_config["cookie_file"])
+                    await page.goto(write_url, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(5000)
+                    if len(context.pages) > 1:
+                        page = context.pages[-1]
+                        await page.wait_for_load_state("domcontentloaded")
+                        await page.wait_for_timeout(3000)
+                    # mainFrame ?ъ랬??                    main_frame = page.frame(name="mainFrame")
+                    if main_frame:
+                        try:
+                            await main_frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                        except Exception:
+                            pass
+                    logger.info(f"[{blog_config['name']}] ?щ줈洹몄씤 ??湲?곌린 ?섏씠吏: {page.url}")
+                    if main_frame:
+                        logger.info(f"?щ줈洹몄씤 ??mainFrame: {main_frame.url[:60]}")
+            else:
+                logger.warning("mainFrame frame 媛앹껜 ?놁쓬, 怨꾩냽 吏꾪뻾")
+
+            # [?ㅽ겕由곗꺑 1] 湲?곌린 ?섏씠吏 濡쒕뱶 吏곹썑
+            await _screenshot(page, "01_write_page_loaded", run_id)
+
+            # 3-1. "?묒꽦 以묒씤 湲???덉뒿?덈떎" HTML ?앹뾽 泥섎━
+            # (釉뚮씪?곗? native dialog媛 ?꾨땶 HTML 紐⑤떖 ??page.on("dialog") 誘몄쿂由?
+            await _dismiss_draft_popup(page)
+            await page.wait_for_timeout(800)
+
+            # 3-2. SmartEditor ONE 蹂몃Ц ?곸뿭 濡쒕뱶 ?꾨즺 ?湲?            # (珥덉븞 ?앹뾽 ?녿뒗 怨꾩젙? ?湲??놁씠 諛붾줈 吏꾪뻾 ???먮뵒??誘몄큹湲고솕 ?곹깭濡??대┃)
+            if main_frame:
+                try:
+                    await main_frame.wait_for_selector(
+                        '.se-placeholder, .se-component.se-text',
+                        timeout=8000
+                    )
+                    await page.wait_for_timeout(1000)
+                    logger.info("SmartEditor 蹂몃Ц ?곸뿭 濡쒕뱶 ?꾨즺")
+                except Exception:
+                    logger.warning("SmartEditor 蹂몃Ц ?곸뿭 濡쒕뱶 ?湲???꾩븘?? 怨꾩냽 吏꾪뻾")
+
+            # 4. ?쒕ぉ ?낅젰
+            await _enter_title(page, title)
+            await page.wait_for_timeout(1500)
+
+            # [?ㅽ겕由곗꺑 2] ?쒕ぉ ?낅젰 ??            await _screenshot(page, "02_after_title", run_id)
+
+            # 5. 蹂몃Ц ?낅젰 (?쒓렇瑜?蹂몃Ц ???댁떆?쒓렇濡?異붽?)
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()][:10]
+            if tag_list:
+                tag_line = " ".join(f"#{t}" for t in tag_list)
+                content_with_tags = content_html + f"<p>{tag_line}</p>"
+            else:
+                content_with_tags = content_html
+
+            logger.info(f"蹂몃Ц ?댁슜 ?뺤씤 (??300??: {content_with_tags[:300]}")
+            logger.info(f"蹂몃Ц 珥?湲몄씠: {len(content_with_tags):,} bytes")
+
+            content_inserted = await _enter_content(page, content_with_tags)
+            await page.wait_for_timeout(1500)
+
+            # [?ㅽ겕由곗꺑 3] 蹂몃Ц ?낅젰 ??            await _screenshot(page, "03_after_content", run_id)
+
+            success = False
+            import re as _re
+
+            if content_inserted:
+                # ?? 寃쎈줈 A: SmartEditor???쎌엯 ?깃났 ??諛쒗뻾 踰꾪듉 ?대┃ ??????
+                # ?ъ슜?먭? ?섎룞?쇰줈 遺숈뿬?ｊ린 ??諛쒗뻾?섎뒗 寃껉낵 ?숈씪??寃쎈줈
+                logger.info("??SmartEditor ?쎌엯 ?깃났 ??諛쒗뻾 踰꾪듉 ?대┃")
+                await _publish(page, run_id)
+                await page.wait_for_timeout(3000)
+                await _screenshot(page, "04_after_publish", run_id)
+                success = True
+            else:
+                # ?? 寃쎈줈 B: SmartEditor ?쎌엯 ?ㅽ뙣 ??PostSaveAjax 吏곸젒 ?몄텧 ??
+                logger.warning("SmartEditor ?쎌엯 ?ㅽ뙣 ??PostSaveAjax API 吏곸젒 ?몄텧 (?대갚)")
+                tag_list_str = tags
+                blog_id_str = blog_config["blog_id"]
+
+                # blogNo 異붿텧 (mainFrame JS 而⑦뀓?ㅽ듃?먯꽌)
+                blog_no = ""
+                if main_frame:
+                    try:
+                        blog_no = await main_frame.evaluate("""
+                            () => {
+                                if (window.__blogNo) return String(window.__blogNo);
+                                if (window.nts_blog && window.nts_blog.blogNo)
+                                    return String(window.nts_blog.blogNo);
+                                for (var s of Array.from(document.scripts)) {
+                                    var m = s.text.match(/"blogNo"\s*:\s*"?(\d+)"?/);
+                                    if (m) return m[1];
+                                    var m2 = s.text.match(/blogNo\s*=\s*['"]?(\d+)['"]?/);
+                                    if (m2) return m2[1];
+                                }
+                                return '';
+                            }
+                        """)
+                        logger.info(f"[PostSaveAjax] blogNo: '{blog_no}'")
+                    except Exception as e:
+                        logger.warning(f"[PostSaveAjax] blogNo 異붿텧 ?ㅽ뙣: {e}")
+
+                logger.info(f"[PostSaveAjax] ?몄텧 ?쒖옉 (title={title[:30]}, "
+                           f"contents={len(content_with_tags):,}bytes)")
+
+                fetch_result = await page.evaluate("""
+                    async ({title, contents, blogId, blogNo, tags, referer}) => {
+                        try {
+                            const params = new URLSearchParams();
+                            params.append('blogId',              blogId);
+                            params.append('blogNo',              blogNo);
+                            params.append('logNo',               '0');
+                            params.append('title',               title);
+                            params.append('contents',            contents);
+                            params.append('categoryNo',          '0');
+                            params.append('tag',                 tags);
+                            params.append('type',                'post');
+                            params.append('status',              'publish');
+                            params.append('useRssYN',            'Y');
+                            params.append('allowComment',        'true');
+                            params.append('allowLike',           'true');
+                            params.append('allowExternalSearch', 'true');
+                            params.append('addCategoryYN',       'N');
+                            params.append('addContents',         '');
+                            params.append('publishDate',         '');
+                            params.append('publishTime',         '');
+                            params.append('cclUploadLicense',    '');
+                            params.append('cclCommercial',       '');
+                            params.append('cclModification',     '');
+
+                            const resp = await fetch('https://blog.naver.com/PostSaveAjax.naver', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/x-www-form-urlencoded',
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                    'Referer': referer || window.location.href,
+                                    'Origin': 'https://blog.naver.com',
+                                },
+                                credentials: 'include',
+                                body: params.toString(),
+                            });
+                            const text = await resp.text();
+                            return {ok: resp.ok, status: resp.status, text: text.substring(0, 2000)};
+                        } catch(e) {
+                            return {ok: false, status: 0, text: 'fetch_error: ' + e.message};
+                        }
+                    }
+                """, {
+                    "title":    title,
+                    "contents": content_with_tags,
+                    "blogId":   blog_id_str,
+                    "blogNo":   blog_no,
+                    "tags":     tag_list_str,
+                    "referer":  page.url,
+                })
+
+                logger.info(f"[PostSaveAjax] ?묐떟: status={fetch_result['status']}, "
+                           f"text={fetch_result['text'][:500]}")
+
+                fetch_text = fetch_result.get("text", "")
+                fetch_ok   = fetch_result.get("ok", False)
+
+                log_no_match = _re.search(r'"logNo"\s*:\s*"?(\d+)"?', fetch_text)
+                success = (
+                    log_no_match is not None or
+                    "SUCCESS" in fetch_text.upper() or
+                    (fetch_ok and "error" not in fetch_text.lower() and fetch_result['status'] == 200)
+                )
+
+                if log_no_match:
+                    log_no = log_no_match.group(1)
+                    logger.info(f"[PostSaveAjax] ??諛쒗뻾 ?깃났! logNo={log_no} "
+                               f"??https://blog.naver.com/{blog_id_str}/{log_no}")
+                elif success:
+                    logger.info("[PostSaveAjax] ??諛쒗뻾 ?깃났 (200 OK)")
+                else:
+                    logger.error(f"[PostSaveAjax] ??諛쒗뻾 ?ㅽ뙣: {fetch_text[:300]}")
+
+            # [?ㅽ겕由곗꺑] 諛쒗뻾 ??理쒖쥌 ?곹깭
+            await _screenshot(page, "06_after_publish", run_id)
+
+            if success:
+                cookies = await context.cookies()
+                save_cookies(cookies, blog_config["cookie_file"])
+
+                # 7. ?ㅼ젣 釉붾줈洹몄뿉???ъ뒪??寃利?                verified = await _verify_posted(page, blog_id, title)
+                if verified:
+                    logger.info(f"[{blog_config['name']}] ???ъ뒪???뺤씤 ?꾨즺: {title}")
+                else:
+                    logger.error(f"[{blog_config['name']}] ??諛쒗뻾 ?대┃?덉?留?釉붾줈洹몄뿉??湲??李얠쓣 ???놁쓬: {title}")
+                    await _screenshot(page, "07_verify_failed", run_id)
+                    return False
+
+            logger.info(f"[?ㅽ겕由곗꺑 ?대뜑] {SCREENSHOT_DIR}/{run_id}/")
+            return success
+
+        except PlaywrightTimeout as e:
+            logger.error(f"[{blog_config['name']}] ??꾩븘???ㅻ쪟: {e}")
+            await _screenshot(page, "error_timeout", run_id)
+            return False
+        except Exception as e:
+            logger.error(f"[{blog_config['name']}] ?ъ뒪???ㅻ쪟: {e}", exc_info=True)
+            await _screenshot(page, "error_exception", run_id)
+            return False
+        finally:
+            await page.wait_for_timeout(1000)
+            await browser.close()
+
+
+# ?????????????????????????????????????????
+# ?몃? ?숈옉 ?⑥닔??# ?????????????????????????????????????????
+
+async def _dismiss_draft_popup(page):
+    """'?묒꽦 以묒씤 湲???덉뒿?덈떎' HTML ?앹뾽??'痍⑥냼'濡??リ린 (?댁쟾 珥덉븞 踰꾨━怨??덈줈 ?쒖옉)"""
+    main_frame = page.frame(name="mainFrame")
+    if not main_frame:
+        return
+    try:
+        result = await main_frame.evaluate("""
+            () => {
+                var btns = Array.from(document.querySelectorAll('button'));
+                var cancelBtn = btns.find(b => b.textContent.trim() === '痍⑥냼');
+                if (cancelBtn) { cancelBtn.click(); return 'dismissed'; }
+                return 'no_popup';
+            }
+        """)
+        logger.info(f"珥덉븞 ?앹뾽 泥섎━: {result}")
+    except Exception as e:
+        logger.debug(f"珥덉븞 ?앹뾽 ?뺤씤 以??ㅻ쪟: {e}")
+
+
+async def _enter_title(page, title):
+    """?쒕ぉ ?낅젰 - SmartEditor ONE
+    ?듭떖: Playwright???ㅼ젣 click()?쇰줈 ?ъ빱?ㅻ? 以 ??keyboard.type() ?ъ슜.
+    execCommand留뚯쑝濡쒕뒗 React ?대? ?곹깭媛 媛깆떊?섏? ?딆븘 諛쒗뻾 ???쒕ぉ??鍮꾩뼱踰꾨┝.
+    """
+    main_frame = page.frame(name="mainFrame")
+    if not main_frame:
+        logger.warning("?쒕ぉ ?낅젰 ?ㅽ뙣: mainFrame ?놁쓬")
+        return
+
+    await page.wait_for_timeout(1000)
+
+    # ?쒕ぉ ?곸뿭 selector ?곗꽑?쒖쐞 (SmartEditor ONE)
+    selectors = [
+        '.se-title-text',
+        '.se-title-input',
+        'div[contenteditable="true"][class*="title"]',
+        'div[contenteditable="true"][aria-multiline="false"]',
+        'div[contenteditable="true"][data-placeholder]',
+    ]
+
+    for sel in selectors:
+        try:
+            locator = main_frame.locator(sel).first
+            if await locator.count() == 0:
+                continue
+            # Playwright ?ㅼ젣 ?대┃ ???ъ빱??            await locator.click()
+            await page.wait_for_timeout(400)
+            # ?꾩껜 ?좏깮 ????댄븨 (keyboard.type? React ?대깽???뺤긽 ?몃━嫄?
+            await page.keyboard.press("Control+a")
+            await page.keyboard.type(title, delay=40)
+            await page.wait_for_timeout(300)
+            logger.info(f"?쒕ぉ ?낅젰 ?꾨즺: {title[:30]} (selector: {sel})")
+            return
+        except Exception as e:
+            logger.debug(f"?쒕ぉ selector ?쒕룄 ?ㅽ뙣 ({sel}): {e}")
+            continue
+
+    # 理쒗썑 ?대갚: JS濡?泥?踰덉㎏ contenteditable ?붿냼瑜?吏곸젒 click/focus ??keyboard.type
+    try:
+        result = await main_frame.evaluate("""
+            () => {
+                var all = Array.from(document.querySelectorAll('[contenteditable="true"]'));
+                var el = all.find(function(e) { return e.tagName !== 'BODY'; });
+                if (!el) {
+                    var debug = Array.from(document.querySelectorAll('[contenteditable]'))
+                        .map(function(e) { return e.tagName + '.' + (e.className||'').substring(0,30); }).join('|');
+                    return 'not_found:' + debug;
+                }
+                // Frame?먮뒗 .mouse媛 ?놁쑝誘濡?JS濡?吏곸젒 click/focus
+                el.click();
+                el.focus();
+                return 'ok:' + el.className.substring(0, 40);
+            }
+        """)
+        if result and result.startswith('ok:'):
+            await page.wait_for_timeout(300)
+            await page.keyboard.press("Control+a")
+            await page.keyboard.type(title, delay=40)
+            logger.info(f"?쒕ぉ ?낅젰 ?꾨즺 (JS click ?대갚): {title[:30]} {result}")
+        else:
+            logger.warning(f"?쒕ぉ ?낅젰 ?ㅽ뙣: {result}")
+    except Exception as e:
+        logger.warning(f"?쒕ぉ ?낅젰 ?대갚 ?ㅽ뙣: {e}")
+
+
+async def _enter_content(page, content_html):
+    """蹂몃Ц ?낅젰 - SmartEditor ONE
+
+    ?꾨왂 (?곗꽑?쒖쐞):
+    1. navigator.clipboard.write() + Ctrl+V  ???ъ슜???섎룞 蹂듬텤怨??숈씪, SmartEditor媛 ?뺤긽 泥섎━
+    2. DataTransfer + ClipboardEvent paste   ???대갚 (?쇰? ?섍꼍?먯꽌 ?숈옉)
+    3. DOM 吏곸젒 ?쎌엯                         ??理쒗썑 ?대갚 (SmartEditor ?몄떇 遺덊솗??
+
+    諛섑솚媛? True = ?댁슜 ?쎌엯 ?깃났, False = ?ㅽ뙣 (PostSaveAjax ?대갚 ?꾩슂)
+    """
+    main_frame = page.frame(name="mainFrame")
+    if not main_frame:
+        logger.warning("蹂몃Ц ?낅젰 ?ㅽ뙣: mainFrame ?놁쓬")
+        return False
+
+    # ?? 蹂몃Ц ?곸뿭 ?대┃?섏뿬 ?ъ빱???????????????????????????????????
+    body_selectors = [
+        'p.se-placeholder',
+        '.se-placeholder',
+        '.se-main-section',
+        '.se-component:not(.se-component-title)',
+    ]
+    for sel in body_selectors:
+        try:
+            loc = main_frame.locator(sel).first
+            if await loc.count() > 0:
+                await loc.click(force=True)
+                logger.info(f"蹂몃Ц ?곸뿭 ?대┃: {sel}")
+                await page.wait_for_timeout(800)
+                break
+        except Exception as e:
+            logger.debug(f"蹂몃Ц ?대┃ ?ㅽ뙣 ({sel}): {e}")
+
+    # ?? input_buffer ?꾨젅???湲???????????????????????????????????
+    input_frame = None
+    for wait_i in range(15):
+        input_frame = next((f for f in page.frames if f.name.startswith("input_buffer")), None)
+        if input_frame:
+            break
+        await page.wait_for_timeout(500)
+    if not input_frame:
+        logger.warning("input_buffer ?꾨젅???놁쓬")
+        return False
+    logger.info(f"input_buffer ?꾨젅?? {input_frame.name}")
+
+    # ?? 諛⑸쾿 1: xclip (X11 ?대┰蹂대뱶) + Ctrl+V ????????????????????????
+    # Docker + Xvfb ?섍꼍: xclip?쇰줈 ?쒖뒪???대┰蹂대뱶??HTML ?????Ctrl+V
+    # ?ъ슜?먭? ?몃? ?깆뿉??蹂듬텤?섎뒗 寃껉낵 100% ?숈씪??寃쎈줈
+    logger.info(f"xclip 諛⑹떇 ?쒕룄 (DISPLAY={os.environ.get('DISPLAY','?놁쓬')}, HTML {len(content_html):,} bytes)")
+    if os.environ.get("DISPLAY"):
+        xclip_ok = _xclip_write(content_html)
+        if xclip_ok:
+            try:
+                # mainFrame ?먮뵒???곸뿭???대? ?ъ빱?ㅺ? ?덉쓬 (body_selectors ?대┃)
+                # input_buffer??about:blank(contenteditable ?꾨떂) ???ъ빱??二쇰㈃ ????                # page.keyboard.press() ???꾩옱 ?ъ빱?ㅻ맂 mainFrame ?먮뵒?곕줈 ?꾨떖
+                await page.keyboard.press("Control+v")
+                await page.wait_for_timeout(2500)
+
+                # mainFrame ?띿뒪??湲몄씠濡??깃났 ?щ? ?뺤씤
+                main_content = await main_frame.evaluate("""
+                    () => {
+                        var els = document.querySelectorAll(
+                            '.se-text-paragraph, .se-component-content, .se-module-text');
+                        var total = 0;
+                        els.forEach(function(e) { total += e.textContent.trim().length; });
+                        return total;
+                    }
+                """)
+                logger.info(f"xclip Ctrl+V ??mainFrame ?띿뒪??湲몄씠: {main_content}")
+
+                if main_content > 100:
+                    logger.info("??蹂몃Ц ?낅젰 ?꾨즺 (xclip + Ctrl+V 諛⑹떇)")
+                    return True
+                else:
+                    logger.warning(f"xclip Ctrl+V ??mainFrame ?댁슜 ?놁쓬 ({main_content}) ???ㅼ쓬 諛⑸쾿 ?쒕룄")
+            except Exception as e:
+                logger.warning(f"xclip Ctrl+V ?ㅽ뙣: {e}")
+        else:
+            logger.warning("xclip ????ㅽ뙣 ??navigator.clipboard ?쒕룄")
+
+    # ?? 諛⑸쾿 2: navigator.clipboard.write() + Ctrl+V (硫붿씤 諛⑹떇) ?????
+    # ?ъ슜?먭? ?섎룞?쇰줈 蹂듭궗-遺숈뿬?ｊ린 ???뚯? ?꾩쟾???숈씪??寃쎈줈
+    # SmartEditor媛 ?ㅼ젣 paste ?대깽?몃줈 泥섎━ ???대? JSON ?щ㎎ 蹂??    logger.info(f"navigator.clipboard + Ctrl+V 諛⑹떇 ?쒕룄 (HTML {len(content_html):,} bytes)")
+    try:
+        # Playwright 而⑦뀓?ㅽ듃???대┰蹂대뱶 沅뚰븳 遺??        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+
+        # mainFrame 而⑦뀓?ㅽ듃?먯꽌 ?대┰蹂대뱶??HTML ?곌린
+        # (input_frame ?ъ빱?ㅻ? 二쇰㈃ ????- about:blank??contenteditable ?꾨떂)
+        clip_result = await main_frame.evaluate("""async (html) => {
+            try {
+                const htmlBlob = new Blob([html], {type: 'text/html'});
+                const textBlob = new Blob([html.replace(/<[^>]+>/g, ' ')], {type: 'text/plain'});
+                const item = new ClipboardItem({'text/html': htmlBlob, 'text/plain': textBlob});
+                await navigator.clipboard.write([item]);
+                return 'html_clipboard_ok';
+            } catch(e1) {
+                try {
+                    await navigator.clipboard.writeText(html);
+                    return 'text_clipboard_ok';
+                } catch(e2) {
+                    return 'error: ' + e1.message + ' | ' + e2.message;
+                }
+            }
+        }""", content_html)
+        logger.info(f"?대┰蹂대뱶 ?곌린 寃곌낵: {clip_result}")
+
+        # mainFrame ?먮뵒???ъ빱???좎? ?곹깭?먯꽌 Ctrl+V
+        await page.keyboard.press("Control+v")
+        await page.wait_for_timeout(2500)
+
+        main_content = await main_frame.evaluate("""
+            () => {
+                var els = document.querySelectorAll(
+                    '.se-text-paragraph, .se-component-content, .se-module-text');
+                var total = 0;
+                els.forEach(function(e) { total += e.textContent.trim().length; });
+                return total;
+            }
+        """)
+        logger.info(f"navigator.clipboard Ctrl+V ??mainFrame ?띿뒪??湲몄씠: {main_content}")
+
+        if main_content > 100:
+            logger.info("??蹂몃Ц ?낅젰 ?꾨즺 (navigator.clipboard + Ctrl+V 諛⑹떇)")
+            return True
+        else:
+            logger.warning(f"clipboard+Ctrl+V ??mainFrame ?댁슜 ?놁쓬 ({main_content}) ??DataTransfer ?대갚")
+    except Exception as e:
+        logger.warning(f"clipboard+Ctrl+V 諛⑹떇 ?ㅽ뙣: {e}")
+
+    # ?? 諛⑸쾿 3: DataTransfer + ClipboardEvent paste (?대갚) ??????????
+    logger.info("DataTransfer paste ?대갚 ?쒕룄")
+    try:
+        await input_frame.evaluate("document.body.focus()")
+        await page.wait_for_timeout(300)
+        before_len = await input_frame.evaluate("document.body.innerHTML.length")
+
+        paste_result = await input_frame.evaluate("""
+            (html) => {
+                try {
+                    var body = document.body;
+                    body.focus();
+                    var sel = window.getSelection();
+                    var range = document.createRange();
+                    range.selectNodeContents(body);
+                    range.collapse(false);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    var dt = new DataTransfer();
+                    dt.setData('text/html', html);
+                    dt.setData('text/plain', body.innerText || '');
+                    var pasteEvent = new ClipboardEvent('paste', {
+                        clipboardData: dt, bubbles: true, cancelable: true
+                    });
+                    body.dispatchEvent(pasteEvent);
+                    return 'dispatched:' + body.innerHTML.length;
+                } catch(e) { return 'error:' + e.message; }
+            }
+        """, content_html)
+        await page.wait_for_timeout(1500)
+        after_len = await input_frame.evaluate("document.body.innerHTML.length")
+        logger.info(f"DataTransfer paste: {paste_result} ??{before_len} ??{after_len}")
+        if after_len > before_len + 100:
+            logger.info("??蹂몃Ц ?낅젰 ?꾨즺 (DataTransfer 諛⑹떇)")
+            return True
+        else:
+            logger.warning(f"DataTransfer paste ??蹂??誘몃? ({before_len} ??{after_len})")
+    except Exception as e:
+        logger.warning(f"DataTransfer paste ?ㅽ뙣: {e}")
+
+    # ?? 諛⑸쾿 3: DOM 吏곸젒 ?쎌엯 (理쒗썑 ?대갚, SmartEditor ?몄떇 遺덊솗?? ??
+    logger.warning("理쒗썑 ?대갚: DOM 吏곸젒 ?쎌엯")
+    try:
+        before_len = await input_frame.evaluate("document.body.innerHTML.length")
+        result = await input_frame.evaluate("""
+            (html) => {
+                var body = document.body;
+                body.focus();
+                var div = document.createElement('div');
+                div.innerHTML = html;
+                var children = Array.from(body.children);
+                var refNode = children.length > 1 ? children[1] : null;
+                if (refNode) body.insertBefore(div, refNode);
+                else body.appendChild(div);
+                ['input', 'keyup', 'change'].forEach(function(n) {
+                    try { body.dispatchEvent(new Event(n, {bubbles:true})); } catch(e){}
+                });
+                return 'dom:' + body.innerHTML.length;
+            }
+        """, content_html)
+        after_len = await input_frame.evaluate("document.body.innerHTML.length")
+        logger.info(f"DOM 吏곸젒 ?쎌엯: {result} ({before_len} ??{after_len})")
+        if after_len > before_len + 100:
+            logger.info("DOM ?쎌엯??(SmartEditor ?몄떇 ?щ? 遺덊솗??")
+    except Exception as e:
+        logger.error(f"DOM ?쎌엯 ?ㅽ뙣: {e}")
+
+    return False
+
+
+async def _enter_tags(page, tags):
+    """?쒓렇 ?낅젰"""
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()][:10]
+    selectors = [
+        "#post-tag input",
+        ".tag_input",
+        "input[placeholder*='?쒓렇']",
+    ]
+    for selector in selectors:
+        try:
+            for tag in tag_list:
+                await page.click(selector, timeout=3000)
+                await page.type(selector, tag, delay=40)
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(400)
+            logger.info(f"?쒓렇 ?낅젰: {', '.join(tag_list)}")
+            return
+        except Exception:
+            continue
+
+    logger.warning("?쒓렇 ?낅젰 ?ㅽ뙣 (怨꾩냽 吏꾪뻾)")
+
+
+_PUBLISH_JS = """
+(function() {
+    var keywords = ['諛쒗뻾', '寃뚯떆', 'publish'];
+    var cssClasses = ['publish', 'btn_publish', 'se_publish'];
+
+    // CSS class 湲곕컲 ?먯깋
+    for (var cls of cssClasses) {
+        var el = document.querySelector('button.' + cls + ', a.' + cls + ', .' + cls);
+        if (el) { el.click(); return 'css:' + cls; }
+    }
+    // ?띿뒪??湲곕컲 ?먯깋 (has-text ???JS濡?
+    var all = Array.from(document.querySelectorAll('button, a[href], input[type="button"]'));
+    for (var kw of keywords) {
+        var btn = all.find(function(b) {
+            return b.textContent.trim() === kw ||
+                   (b.value && b.value.trim() === kw);
+        });
+        if (btn) { btn.click(); return 'text:' + kw; }
+    }
+    return false;
+})()
+"""
+
+_CONFIRM_JS = """
+(function() {
+    // ?대컮(.se-toolbar) ??踰꾪듉? ?쒖쇅 ??泥?踰덉㎏ '諛쒗뻾' ?대┃ ???대? ?ъ슜??踰꾪듉
+    var toolbarEls = new Set(
+        Array.from(document.querySelectorAll('.se-toolbar *, ul[class*="toolbar"] *, [class*="document-toolbar"] *'))
+    );
+
+    var all = Array.from(document.querySelectorAll('button, a[role="button"], a[class*="btn"]'));
+    // ?대컮 ?쒖쇅
+    var candidates = all.filter(function(b) { return !toolbarEls.has(b); });
+
+    // 1. '怨듦컻諛쒗뻾', '諛쒗뻾?섍린', '?꾩껜怨듦컻' ?곗꽑
+    var keywords = ['怨듦컻諛쒗뻾', '諛쒗뻾?섍린', '?꾩껜怨듦컻'];
+    for (var kw of keywords) {
+        var btn = candidates.find(function(b) { return b.textContent.trim().includes(kw); });
+        if (btn) { btn.click(); return 'kw:' + kw + ':' + btn.className.substring(0, 30); }
+    }
+
+    // 2. ?대컮 ??'諛쒗뻾' 踰꾪듉 ?먯깋
+    // 踰꾪듉??2媛쒖씤 寃쎌슦: [0]=?먮뵒???ㅻ뜑 踰꾪듉(?⑤꼸 ?닿린?? y媛??묒쓬), [1]=?⑤꼸 ?뺤씤 踰꾪듉(y媛???
+    // getBoundingClientRect().y媛 媛????踰꾪듉 = ?붾㈃ ?꾨옒履?= ?⑤꼸 ?뺤씤 踰꾪듉
+    var publishBtns = candidates.filter(function(b) { return b.textContent.trim() === '諛쒗뻾'; });
+    if (publishBtns.length > 0) {
+        var btnsDebug = publishBtns.map(function(b, i) {
+            var rect = b.getBoundingClientRect();
+            return i + '(y=' + Math.round(rect.y) + ',cls=' + b.className.substring(0, 20) + ')';
+        }).join('|');
+        // y醫뚰몴媛 媛?????붾㈃ ?꾨옒履? 踰꾪듉 ?대┃ = ?⑤꼸 ?덉쓽 ?뺤씤 諛쒗뻾 踰꾪듉
+        var targetBtn = publishBtns.reduce(function(max, b) {
+            return b.getBoundingClientRect().y > max.getBoundingClientRect().y ? b : max;
+        });
+        targetBtn.click();
+        return 'publish:cnt=' + publishBtns.length + ':btns=[' + btnsDebug + ']:clicked_y=' + Math.round(targetBtn.getBoundingClientRect().y);
+    }
+
+    // 3. ?붾쾭洹? ?꾨낫 踰꾪듉 紐⑸줉 諛섑솚
+    var debugInfo = candidates.slice(0, 10).map(function(b) {
+        return (b.textContent.trim() || b.className).substring(0, 20);
+    }).join('|');
+    return 'not_found:candidates=' + candidates.length + ':' + debugInfo;
+})()
+"""
+
+
+async def _verify_posted(page, blog_id: str, title: str) -> bool:
+    """諛쒗뻾 ???ㅼ젣 釉붾줈洹몄뿉??湲 ?쒕ぉ ?뺤씤"""
+    try:
+        # 諛쒗뻾 ???섏씠吏媛 ?대? ?대룞?덈뒗吏 癒쇱? ?뺤씤
+        await page.wait_for_timeout(2000)
+        current_url = page.url
+        logger.info(f"[寃利? ?꾩옱 URL: {current_url[:80]}")
+
+        # ?먮뵒??URL???꾨땶 釉붾줈洹?URL濡??대룞?덉쑝硫?諛쒗뻾 ?깃났
+        if ("PostWriteForm" not in current_url and
+                "Redirect=Write" not in current_url and
+                blog_id in current_url):
+            logger.info(f"[寃利? 諛쒗뻾 ??釉붾줈洹?URL ?대룞 ?뺤씤 ?? {current_url[:60]}")
+            return True
+
+        # 釉붾줈洹??덉쑝濡??대룞?댁꽌 ?쒕ぉ 寃??        blog_url = f"https://blog.naver.com/{blog_id}"
+        await page.goto(blog_url, wait_until="domcontentloaded", timeout=15000)
+        await page.wait_for_timeout(3000)
+        content = await page.content()
+        found = title in content
+        logger.info(f"[寃利? 釉붾줈洹?{blog_url}) ?먯꽌 '{title[:20]}' {'諛쒓껄 ?? if found else '誘몃컻寃???}")
+        return found
+    except Exception as e:
+        logger.warning(f"[寃利? 釉붾줈洹??뺤씤 ?ㅽ뙣: {e}")
+        return False
+
+
+async def _publish(page, run_id: str = ""):
+    """諛쒗뻾 踰꾪듉 ?대┃ - SmartEditor ONE (JS 湲곕컲, has-text ?쒓굅濡?timeout 諛⑹?)"""
+    main_frame = page.frame(name="mainFrame")
+    search_frames = []
+    if main_frame:
+        search_frames.append(main_frame)
+        search_frames.extend(main_frame.child_frames)
+    for f in page.frames:
+        if f not in search_frames:
+            search_frames.append(f)
+
+    # 1?④퀎: 諛쒗뻾 踰꾪듉 (硫붿씤 ?섏씠吏 ??frames ?? JS ?띿뒪???먯깋)
+    clicked = False
+
+    # 硫붿씤 ?섏씠吏 癒쇱?
+    try:
+        result = await page.evaluate(_PUBLISH_JS)
+        if result:
+            logger.info(f"諛쒗뻾 踰꾪듉 ?대┃(main): {result}")
+            await page.wait_for_timeout(3000)
+            clicked = True
+    except Exception:
+        pass
+
+    if not clicked:
+        for frame in search_frames:
+            try:
+                result = await frame.evaluate(_PUBLISH_JS)
+                if result:
+                    logger.info(f"諛쒗뻾 踰꾪듉 ?대┃(frame): {result}")
+                    await page.wait_for_timeout(3000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+    if not clicked:
+        logger.error("諛쒗뻾 踰꾪듉 ?놁쓬")
+        await _screenshot(page, "04_publish_btn_notfound", run_id)
+        return False
+
+    # [?ㅽ겕由곗꺑 4] 泥?踰덉㎏ 諛쒗뻾 踰꾪듉 ?대┃ 吏곹썑 (?⑤꼸???대졇?붿? ?뺤씤)
+    await _screenshot(page, "04_after_publish_click", run_id)
+
+    # 2?④퀎: 諛쒗뻾 ?뺤씤 ?⑤꼸 泥섎━ (?대┃ ???⑤꼸???대━湲곌퉴吏 ?湲???諛섎났 ?먯깋)
+    logger.info("諛쒗뻾 ?뺤씤 ?⑤꼸 ?湲?以?..")
+    await page.wait_for_timeout(3000)  # ?⑤꼸 ?좊땲硫붿씠???湲?
+    # [?ㅽ겕由곗꺑 5] ?⑤꼸 ?湲???(?⑤꼸 ?댁슜 ?뺤씤)
+    await _screenshot(page, "05_publish_panel", run_id)
+
+    for attempt in range(8):
+        await page.wait_for_timeout(1500)
+        confirmed = False
+
+        # 硫붿씤 ?섏씠吏?먯꽌 癒쇱?
+        try:
+            result = await page.evaluate(_CONFIRM_JS)
+            if result and not str(result).startswith('not_found'):
+                logger.info(f"諛쒗뻾 ?뺤씤: {result}")
+                await page.wait_for_timeout(3000)
+                return True
+            elif result:
+                logger.info(f"諛쒗뻾 ?뺤씤 ?먯깋以?main): {result}")
+        except Exception:
+            pass
+
+        # frames?먯꽌 ?먯깋
+        for frame in search_frames:
+            try:
+                result = await frame.evaluate(_CONFIRM_JS)
+                if result and not str(result).startswith('not_found'):
+                    logger.info(f"諛쒗뻾 ?뺤씤(frame/{frame.name or 'noname'}): {result}")
+                    await page.wait_for_timeout(3000)
+                    return True
+                elif result:
+                    logger.info(f"諛쒗뻾 ?뺤씤 ?먯깋以?{frame.name or 'noname'}): {result}")
+            except Exception:
+                continue
+
+        if attempt == 0:
+            logger.info("?뺤씤 踰꾪듉 誘몃컻寃? 怨꾩냽 ?먯깋 以?..")
+
+    logger.warning("諛쒗뻾 ?뺤씤 踰꾪듉 誘몃컻寃???諛쒗뻾???꾨즺?섏? ?딆븯?????덉쓬")
+    return False
+
+
+# ?????????????????????????????????????????
+# HTTP API ?대갚 (釉뚮씪?곗? ?놁씠 requests ?ъ슜)
+# ?????????????????????????????????????????
+
+def _cookies_to_requests(playwright_cookies):
+    """Playwright 荑좏궎 由ъ뒪????requests CookieJar ?명솚 dict"""
+    return {c["name"]: c["value"] for c in playwright_cookies if "name" in c and "value" in c}
+
+
+def post_via_http(title, content_html, tags, category, blog_config) -> bool:
+    """
+    釉뚮씪?곗? ?놁씠 requests濡?Naver Blog AJAX API 吏곸젒 ?몄텧.
+    ??λ맂 荑좏궎媛 ?좏슚?댁빞 ?숈옉 (留뚮즺 ??False 諛섑솚).
+    """
+    import requests as req
+
+    cookie_data = load_cookies(blog_config["cookie_file"])
+    if not cookie_data:
+        logger.error("[HTTP] ??λ맂 荑좏궎 ?놁쓬 ??first_login.py ?ㅽ뻾 ?꾩슂")
+        return False
+
+    blog_id  = blog_config["blog_id"]
+    naver_id = blog_config["naver_id"]
+
+    session = req.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer": f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://blog.naver.com",
+    })
+    session.cookies.update(_cookies_to_requests(cookie_data))
+
+    # 濡쒓렇???곹깭 ?뺤씤
+    try:
+        check = session.get("https://www.naver.com", timeout=10)
+        if naver_id.lower() not in check.text.lower() and "濡쒓렇?꾩썐" not in check.text:
+            logger.error("[HTTP] 荑좏궎 留뚮즺 ??first_login.py 濡??щ줈洹몄씤 ?꾩슂")
+            return False
+    except Exception as e:
+        logger.error(f"[HTTP] 濡쒓렇???뺤씤 ?ㅽ뙣: {e}")
+        return False
+
+    # 湲?곌린 ??GET ???④꺼吏??좏겙 異붿텧
+    try:
+        form_resp = session.get(
+            f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}",
+            timeout=15,
+        )
+    except Exception as e:
+        logger.error(f"[HTTP] 湲?곌린 ??濡쒕뱶 ?ㅽ뙣: {e}")
+        return False
+
+    # CSRF / blogNo ?뚯떛 ?쒕룄
+    blog_no = ""
+    import re
+    m = re.search(r'"blogNo"\s*:\s*"?(\d+)"?', form_resp.text)
+    if m:
+        blog_no = m.group(1)
+
+    # ?ъ뒪??AJAX ?붿껌
+    post_data = {
+        "blogId":              blog_id,
+        "blogNo":              blog_no,
+        "logNo":               "0",
+        "title":               title,
+        "contents":            content_html,
+        "categoryNo":          "0",
+        "tag":                 tags,
+        "type":                "post",
+        "status":              "publish",
+        "useRssYN":            "Y",
+        "allowComment":        "true",
+        "allowLike":           "true",
+        "allowExternalSearch": "true",
+        "addCategoryYN":       "N",
+        "addContents":         "",
+        "publishDate":         "",
+        "publishTime":         "",
+        "cclUploadLicense":    "",
+        "cclCommercial":       "",
+        "cclModification":     "",
+    }
+
+    try:
+        resp = session.post(
+            "https://blog.naver.com/PostSaveAjax.naver",
+            data=post_data,
+            timeout=30,
+        )
+        logger.info(f"[HTTP] ?묐떟 {resp.status_code}: {resp.text[:300]}")
+        try:
+            j = resp.json()
+            if j.get("result") == "SUCCESS" or j.get("logNo") or j.get("postNo"):
+                logger.info(f"[HTTP] ???ъ뒪???깃났: {j}")
+                return True
+            logger.error(f"[HTTP] API ?ㅻ쪟 ?묐떟: {j}")
+        except Exception:
+            # JSON???꾨땶 寃쎌슦 200?대㈃ ?깃났?쇰줈 媛꾩＜
+            if resp.status_code == 200 and "error" not in resp.text.lower():
+                logger.info("[HTTP] ???ъ뒪???깃났 (鍮껲SON 200 ?묐떟)")
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"[HTTP] POST ?ㅽ뙣: {e}")
+        return False
+
+
+# ?????????????????????????????????????????
+# ?숆린 ?섑띁 & 濡쒖뺄 ???# ?????????????????????????????????????????
+
+def post_blog(title, content_html, tags, category, blog_config):
+    """釉뚮씪?곗? ?쒕룄 ??HTTP API ?대갚 ??False"""
+    # 釉뚮씪?곗? ?쒕룄
+    try:
+        return asyncio.run(post_to_naver_blog(title, content_html, tags, category, blog_config))
+    except BrowserUnavailableError:
+        logger.warning("[post_blog] 釉뚮씪?곗? 遺덇? ??HTTP API ?대갚")
+        return post_via_http(title, content_html, tags, category, blog_config)
+
+
+def save_post_locally(title, content_html, tags, category, blog_config, filename=None):
+    """?ъ뒪???ㅽ뙣 ??濡쒖뺄 ?꾩떆 ???""
+    blog_key = blog_config.get("blog_id", "unknown")
+    drafts_dir = f"drafts/{blog_key}"
+    os.makedirs(drafts_dir, exist_ok=True)
+
+    if not filename:
+        safe_title = "".join(c for c in title[:30] if c.isalnum() or c in " _-")
+        filename = f"{drafts_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_title}.json"
+
+    draft = {
+        "title": title,
+        "content_html": content_html,
+        "tags": tags,
+        "category": category,
+        "blog": blog_config.get("name", ""),
+        "created_at": datetime.now().isoformat(),
+        "posted": False,
+    }
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(draft, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"?꾩떆 ??? {filename}")
+    return filename

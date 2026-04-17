@@ -18,6 +18,38 @@ from config import OPENROUTER_API_KEY, ANTHROPIC_API_KEY
 
 logger = logging.getLogger(__name__)
 
+
+def _clean_json_string(text: str) -> str:
+    """LLM이 출력한 JSON에서 invalid escape·문자열 내 줄바꿈 등을 정리."""
+    # JSON 문자열 값 내부의 실제 줄바꿈을 \\n으로 치환
+    # (문자열 토큰 밖의 줄바꿈은 유지)
+    result = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            # 유효하지 않은 escape 시퀀스는 그냥 문자로 처리
+            if ch not in ('"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'):
+                result.append('\\\\')  # 백슬래시를 이스케이프
+            else:
+                result.append('\\')
+            result.append(ch)
+            escape_next = False
+        elif ch == '\\' and in_string:
+            escape_next = True
+        elif ch == '"' and not escape_next:
+            in_string = not in_string
+            result.append(ch)
+        elif in_string and ch == '\n':
+            result.append('\\n')
+        elif in_string and ch == '\r':
+            result.append('\\r')
+        elif in_string and ch == '\t':
+            result.append('\\t')
+        else:
+            result.append(ch)
+    return ''.join(result)
+
 # ─── OpenRouter 실제 가용 무료 모델 (2026-03 기준 검증 완료) ────
 
 # 대형 고품질 모델
@@ -72,14 +104,10 @@ class BaseAgent:
         self.fallback_models = fallback_models if fallback_models is not None else self.FALLBACK_MODELS
 
     def _build_model_queue(self) -> List[str]:
-        """메인 → 지정 폴백 → FREE_POOL 나머지 (순서 고정, 중복 제거)"""
+        """[수정됨] 메인 → 지정 폴백 모델까지만 사용 (API 호출 최소화)"""
         queue = [self.primary_model] + self.fallback_models
-        seen  = set(queue)
-        for m in FREE_POOL:
-            if m not in seen:
-                queue.append(m)
-                seen.add(m)
-        return queue
+        # 중복 제거 (순서 유지)
+        return list(dict.fromkeys(queue))
 
     # ── 핵심 메서드: 모델 폴백 + 429 재시도 ──────────────────────
     def chat(
@@ -102,6 +130,7 @@ class BaseAgent:
                     temperature=temperature,
                     messages=messages,
                 )
+                time.sleep(1)  # API 속도 제한 방지를 위해 1초 대기
                 text = resp.choices[0].message.content
                 if text and text.strip():
                     logger.info(f"[{self.__class__.__name__}] 성공 ({model})")
@@ -158,5 +187,11 @@ class BaseAgent:
         try:
             return json.loads(text)
         except json.JSONDecodeError as e:
+            # 문자열 내 줄바꿈·탭·invalid escape 정리 후 재시도
+            try:
+                cleaned = _clean_json_string(text)
+                return json.loads(cleaned)
+            except Exception:
+                pass
             logger.error(f"[{self.__class__.__name__}] JSON 파싱 실패: {e}\n원문: {text[:200]}")
             return None

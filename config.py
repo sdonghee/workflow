@@ -15,6 +15,13 @@ UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
 PEXELS_API_KEY      = os.getenv("PEXELS_API_KEY", "")
 PIXABAY_API_KEY     = os.getenv("PIXABAY_API_KEY", "")    # Agent 4 이미지 3순위
 
+# ── 이미지 필터링 ────────────────────────────────────────────────
+# 이미지 검색 시 제외할 키워드 목록 (소문자로 작성)
+IMAGE_EXCLUDE_KEYWORDS = [
+    "bible", "religion", "church", "christian", "jesus", "cross",
+    "성경", "교회", "종교", "기독교", "예수", "십자가"
+]
+
 # ── 검색 API ─────────────────────────────────────────────────────
 GOOGLE_SEARCH_API_KEY    = os.getenv("GOOGLE_SEARCH_API_KEY", "")
 GOOGLE_SEARCH_ENGINE_ID  = os.getenv("GOOGLE_SEARCH_ENGINE_ID", "")
@@ -27,11 +34,13 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")  # Gmail 앱 비밀번�
 
 # ── 포스팅 타이밍 ────────────────────────────────────────────────
 POSTS_PER_DAY      = int(os.getenv("POSTS_PER_DAY", "7"))
-POST_START_HOUR    = int(os.getenv("POST_START_HOUR", "6"))   # 1회차 06:00
+POST_START_HOUR    = int(os.getenv("POST_START_HOUR", "9"))    # 1회차 09:00
 POST_START_HOUR_2  = int(os.getenv("POST_START_HOUR_2", "12"))  # 2회차 12:00
+POST_START_HOUR_3  = int(os.getenv("POST_START_HOUR_3", "15"))  # 3회차 15:00
+POST_START_HOUR_4  = int(os.getenv("POST_START_HOUR_4", "18"))  # 4회차 18:00
 POST_INTERVAL_MIN  = int(os.getenv("POST_INTERVAL_MIN", "120"))  # 포스트간 최소 대기(분)
 POST_INTERVAL_MAX  = int(os.getenv("POST_INTERVAL_MAX", "240"))  # 포스트간 최대 대기(분)
-HEADLESS           = os.getenv("HEADLESS", "true").lower() == "true"
+HEADLESS           = os.getenv("HEADLESS", "false").lower() == "true"
 LOG_LEVEL          = os.getenv("LOG_LEVEL", "INFO")
 
 # ─────────────────────────────────────────
@@ -46,6 +55,14 @@ BLOGS = {
         "blog_id": os.getenv("BLOG1_BLOG_ID", ""),
         "cookie_file": "cookies_blog1.json",
         "categories": ["여행_항공_호텔"],
+        # 실제 블로그 카테고리 ID 매핑 (categoryNo)
+        # 블로그 홈 mainFrame 기준: 항공 뉴스(1), 여행 뉴스(6), 호텔 뉴스(7), 여행기(8), 날씨(9)
+        "category_ids": {
+            "여행_항공_호텔": 6,  # → 여행 뉴스 (기본 매핑)
+            "항공":          1,  # → 항공 뉴스
+            "호텔":          7,  # → 호텔 뉴스
+            "여행기":        8,  # → 여행기
+        },
     },
     "info": {
         "name": "정보/건강 블로그",
@@ -54,6 +71,12 @@ BLOGS = {
         "blog_id": os.getenv("BLOG2_BLOG_ID", ""),
         "cookie_file": "cookies_blog2.json",
         "categories": ["정부혜택", "건강"],
+        # 실제 블로그 카테고리 ID 매핑 (categoryNo)
+        # 블로그 홈 mainFrame 기준: 낙서장(1), 시사/경제/정책(7), 라이프스타일/생활(9)
+        "category_ids": {
+            "정부혜택": 7,   # → 시사/경제/정책 관련
+            "건강":    9,   # → 라이프스타일/생활
+        },
     },
     # 3번째 블로그 추가 시 아래 주석 해제 후 .env에 BLOG3_* 추가
     # "blog3": {
@@ -89,7 +112,7 @@ CATEGORIES = {
         ],
         "image_keywords": ["travel", "hotel", "airplane", "vacation", "tourism"],
         "tags": ["여행", "해외여행", "국내여행", "항공", "호텔", "여행팁", "여행추천", "호캉스", "여행정보", "관광"],
-        "post_count": 3,
+        "post_count": 1,
     },
     "정부혜택": {
         "keywords": [

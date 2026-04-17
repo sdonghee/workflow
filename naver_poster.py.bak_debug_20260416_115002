@@ -1,0 +1,1725 @@
+﻿# LEGACY: save_post_locally() 만 실사용. 나머지는 레거시.
+# 실제 발행은 runners/run_single_post.py 사용.
+import asyncio
+import logging
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+from datetime import datetime
+
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+from config import BLOGS, HEADLESS
+
+# 스크린샷 디렉토리 설정
+SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "screenshots")
+
+logger = logging.getLogger(__name__)
+
+# ... (중간 생략) ...
+
+# ─────────────────────────────────────────
+# 세부 동작 함수들
+# ─────────────────────────────────────────
+
+async def _get_category_no(page, blog_id: str, category_name: str) -> str:
+    """블로그 카테고리 목록 API에서 category_name과 일치하는 categoryNo 반환.
+
+    네이버 블로그 카테고리 API: /CategoryManage.naver?blogId=xxx
+    일치 항목 없으면 '0' (미분류) 반환.
+    category_name 매칭: 완전일치 → 부분일치 순서로 시도.
+    """
+    try:
+        cat_url = f"https://blog.naver.com/CategoryManage.naver?blogId={blog_id}"
+        resp = await page.evaluate("""
+            async (url) => {
+                try {
+                    const r = await fetch(url, {credentials: 'include'});
+                    return await r.text();
+                } catch(e) { return ''; }
+            }
+        """, cat_url)
+
+        if not resp:
+            logger.warning("[category] API 응답 없음 → categoryNo=0 사용")
+            return "0"
+
+        # JSON 파싱 시도
+        import json as _json
+        try:
+            data = _json.loads(resp)
+            cats = data if isinstance(data, list) else data.get("categories", data.get("categoryList", []))
+        except Exception:
+            # HTML 응답이면 정규식으로 추출
+            import re as _re3
+            cats = [
+                {"categoryNo": m.group(1), "categoryName": m.group(2)}
+                for m in _re3.finditer(r'"categoryNo"\s*:\s*"?(\d+)"?,\s*"categoryName"\s*:\s*"([^"]+)"', resp)
+            ]
+
+        if not cats:
+            logger.warning("[category] 카테고리 목록 비어있음 → categoryNo=0")
+            return "0"
+
+        # 완전 일치 우선
+        for cat in cats:
+            name = cat.get("categoryName", cat.get("name", ""))
+            if name == category_name:
+                no = str(cat.get("categoryNo", cat.get("no", "0")))
+                logger.info(f"[category] 완전 일치: '{name}' → categoryNo={no}")
+                return no
+
+        # 부분 일치
+        category_lower = category_name.lower().replace("_", " ").replace("/", " ")
+        for cat in cats:
+            name = cat.get("categoryName", cat.get("name", ""))
+            name_lower = name.lower()
+            if category_lower in name_lower or name_lower in category_lower:
+                no = str(cat.get("categoryNo", cat.get("no", "0")))
+                logger.info(f"[category] 부분 일치: '{name}' → categoryNo={no}")
+                return no
+
+        logger.warning(f"[category] '{category_name}' 매칭 실패 → categoryNo=0 (미분류)")
+        return "0"
+
+    except Exception as e:
+        logger.warning(f"[category] 조회 실패: {e} → categoryNo=0")
+        return "0"
+
+
+async def _verify_posted(page, blog_id: str, title: str, log_no: str | None = None) -> bool:
+    """
+    Verify that the newly published post is actually visible on Naver blog.
+    Strict mode: no fallback based on "recent post count".
+    """
+    try:
+        # 1) If logNo is known, verify direct post URL first (most reliable).
+        if log_no:
+            direct_url = f"https://blog.naver.com/{blog_id}/{log_no}"
+            logger.info(f"Direct URL verify: {direct_url}")
+            await page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            direct_content = await page.content()
+            if title in direct_content:
+                logger.info(f"✅ Direct URL verification succeeded: {title}")
+                return True
+
+        # 2) Current page must be a real PostView URL to count as success.
+        current_url = page.url
+        if "PostView.naver" in current_url:
+            logger.info(f"✅ PostView redirect confirmed: {current_url}")
+            return True
+
+        # 3) Open blog home and check exact title in mainFrame/page source.
+        blog_url = f"https://blog.naver.com/{blog_id}"
+        logger.info(f"Blog verification start: {blog_url}")
+        await page.goto(blog_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+
+        # 블로그 홈 스크린샷 (디버깅)
+        await _screenshot(page, "verify_blog_home", blog_id)
+
+        main_frame = page.frame(name="mainFrame")
+        if main_frame:
+            try:
+                await main_frame.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            iframe_content = await main_frame.content()
+            if title in iframe_content:
+                logger.info(f"✅ mainFrame title match: {title}")
+                return True
+
+        content = await page.content()
+        if title in content:
+            logger.info(f"✅ page source title match: {title}")
+            return True
+
+        logger.warning(f"⚠️ posted-title not found on blog: {title}")
+        return False
+
+    except Exception as e:
+        logger.error(f"Blog verification error: {e}")
+        return False
+
+
+def _ensure_xvfb() -> bool:
+    """Xvfb 가상 X11 디스플레이 시작 (없으면 headless 유지)
+
+    SmartEditor ONE은 실제 시스템 클립보드 Ctrl+V만 허용.
+    Docker headless 환경에서는 X11 디스플레이 없이 xclip 불가 → Xvfb로 해결.
+    """
+    global _xvfb_proc
+    if os.environ.get("DISPLAY"):
+        logger.info(f"DISPLAY 이미 설정: {os.environ['DISPLAY']}")
+        return True
+    try:
+        _xvfb_proc = subprocess.Popen(
+            ["Xvfb", ":99", "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        time.sleep(1.5)  # Xvfb 초기화 대기
+        logger.info("✅ Xvfb :99 시작 → DISPLAY=:99 (비headless 모드로 전환)")
+        return True
+    except FileNotFoundError:
+        logger.warning("Xvfb 없음 → headless 모드 유지 (클립보드 제한)")
+        return False
+    except Exception as e:
+        logger.warning(f"Xvfb 시작 실패: {e}")
+        return False
+
+
+def _build_cf_html(html_fragment: str) -> bytes:
+    """Windows CF_HTML 클립보드 포맷 빌더.
+
+    SmartEditor ONE은 Windows CF_HTML 포맷의 HTML 클립보드를 인식함.
+    바이트 오프셋이 정확해야 하므로 UTF-8 인코딩 후 계산.
+    """
+    HEADER = (
+        "Version:0.9\r\n"
+        "StartHTML:{start_html:010d}\r\n"
+        "EndHTML:{end_html:010d}\r\n"
+        "StartFragment:{start_frag:010d}\r\n"
+        "EndFragment:{end_frag:010d}\r\n"
+    )
+    PRE  = "<html><body>\r\n<!--StartFragment-->"
+    POST = "<!--EndFragment-->\r\n</body></html>"
+
+    # 더미 헤더로 헤더 바이트 길이 계산
+    dummy = HEADER.format(start_html=0, end_html=0, start_frag=0, end_frag=0)
+    header_len  = len(dummy.encode("utf-8"))
+    pre_bytes   = PRE.encode("utf-8")
+    frag_bytes  = html_fragment.encode("utf-8")
+    post_bytes  = POST.encode("utf-8")
+
+    start_html  = header_len
+    start_frag  = header_len + len(pre_bytes)
+    end_frag    = start_frag + len(frag_bytes)
+    end_html    = end_frag   + len(post_bytes)
+
+    header = HEADER.format(
+        start_html=start_html, end_html=end_html,
+        start_frag=start_frag, end_frag=end_frag,
+    )
+    return header.encode("utf-8") + pre_bytes + frag_bytes + post_bytes
+
+
+def _xclip_write(html: str) -> bool:
+    """HTML을 X11 클립보드에 씀 (xclip 사용)
+
+    xclip은 다른 프로세스가 클립보드를 요청할 때까지 실행 유지 (데몬 방식).
+    subprocess.run()으로 기다리면 타임아웃 → Popen()으로 백그라운드 실행해야 함.
+    """
+    if not os.environ.get("DISPLAY"):
+        return False
+    try:
+        # Popen: stdin으로 데이터 전달 후 백그라운드에서 대기
+        # xclip은 Ctrl+V(clipboard 요청)를 받으면 데이터 제공 후 종료
+        proc = subprocess.Popen(
+            ["xclip", "-selection", "clipboard", "-t", "text/html"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.stdin.write(html.encode("utf-8"))
+        proc.stdin.close()
+        # 완료 대기 없음 - xclip이 클립보드 요청을 받을 때까지 실행 유지
+        time.sleep(0.3)  # xclip 클립보드 소유권 등록 대기
+        logger.info(f"xclip text/html 백그라운드 실행 ({len(html):,} bytes)")
+        return True
+    except FileNotFoundError:
+        logger.warning("xclip 없음")
+        return False
+    except Exception as e:
+        logger.warning(f"xclip 예외: {e}")
+        return False
+
+
+# ─────────────────────────────────────────
+# 스크린샷 저장 헬퍼
+# ─────────────────────────────────────────
+
+async def _screenshot(page, step: str, run_id: str):
+    """현재 화면을 screenshots/{run_id}/{step}.png 로 저장"""
+    try:
+        dir_path = os.path.join(SCREENSHOT_DIR, run_id)
+        os.makedirs(dir_path, exist_ok=True)
+        path = os.path.join(dir_path, f"{step}.png")
+        await page.screenshot(path=path, full_page=False)
+        logger.info(f"[스크린샷] {path}")
+    except Exception as e:
+        logger.warning(f"[스크린샷 실패] {step}: {e}")
+
+
+# ─────────────────────────────────────────
+# 쿠키 저장 / 불러오기
+# ─────────────────────────────────────────
+
+def save_cookies(cookies, cookie_file):
+    with open(cookie_file, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, ensure_ascii=False, indent=2)
+    logger.info(f"쿠키 저장 완료: {cookie_file}")
+
+
+def load_cookies(cookie_file):
+    if not os.path.exists(cookie_file):
+        return None
+    with open(cookie_file, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+        if not content:
+            return None
+        return json.loads(content)
+
+
+# ─────────────────────────────────────────
+# 로그인 상태 확인
+# ─────────────────────────────────────────
+
+async def is_logged_in(page, naver_id):
+    """현재 네이버에 로그인되어 있는지 확인"""
+    try:
+        await page.goto("https://www.naver.com", wait_until="domcontentloaded", timeout=15000)
+        await page.wait_for_timeout(2000)
+        content = await page.content()
+        return naver_id.lower() in content.lower() or "로그아웃" in content
+    except Exception:
+        return False
+
+
+# ─────────────────────────────────────────
+# 쿠키로 로그인 시도
+# ─────────────────────────────────────────
+
+async def login_with_cookies(context, page, blog_config):
+    """저장된 쿠키로 로그인 시도"""
+    cookies = load_cookies(blog_config["cookie_file"])
+    if not cookies:
+        logger.info(f"[{blog_config['name']}] 저장된 쿠키 없음")
+        return False
+
+    try:
+        await context.add_cookies(cookies)
+        logged_in = await is_logged_in(page, blog_config["naver_id"])
+        if logged_in:
+            logger.info(f"[{blog_config['name']}] ✅ 쿠키 로그인 성공")
+            return True
+        else:
+            logger.info(f"[{blog_config['name']}] 쿠키가 만료되었습니다. 재로그인 필요")
+            return False
+    except Exception as e:
+        logger.error(f"[{blog_config['name']}] 쿠키 로그인 실패: {e}")
+        return False
+
+
+# ─────────────────────────────────────────
+# 자동 로그인 (ID/PW)
+# ─────────────────────────────────────────
+
+async def login_with_password(page, blog_config):
+    """ID/PW로 로그인 (쿠키 없을 때 또는 만료 시)"""
+    naver_id = blog_config["naver_id"]
+    naver_pw = blog_config["naver_pw"]
+    try:
+        await page.goto("https://nid.naver.com/nidlogin.login", wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+
+        await page.click("#id")
+        await page.wait_for_timeout(500)
+        for char in naver_id:
+            await page.type("#id", char, delay=80)
+        await page.wait_for_timeout(700)
+
+        await page.click("#pw")
+        await page.wait_for_timeout(500)
+        for char in naver_pw:
+            await page.type("#pw", char, delay=80)
+        await page.wait_for_timeout(700)
+
+        await page.click(".btn_login")
+        await page.wait_for_timeout(4000)
+
+        current_url = page.url
+        if "nidlogin" in current_url:
+            logger.error(f"[{blog_config['name']}] ❌ 로그인 실패 - 캡차 또는 계정 오류. first_login.py 를 실행하세요")
+            return False
+
+        logger.info(f"[{blog_config['name']}] ✅ ID/PW 로그인 성공")
+        return True
+
+    except Exception as e:
+        logger.error(f"[{blog_config['name']}] 로그인 오류: {e}")
+        return False
+
+
+# ─────────────────────────────────────────
+# 메인 포스팅 함수
+# ─────────────────────────────────────────
+
+class BrowserUnavailableError(RuntimeError):
+    """시스템 라이브러리 부족으로 브라우저를 실행할 수 없을 때"""
+    pass
+
+
+def _is_missing_lib_error(e: Exception) -> bool:
+    msg = str(e)
+    return any(k in msg for k in ("shared libraries", "exitCode=127", "libatk", "libgtk", "exitCode=255", "libmoz"))
+
+
+async def _launch_browser(p):
+    """Chromium → Firefox 순으로 시도, 둘 다 실패 시 BrowserUnavailableError
+
+    DISPLAY 환경변수가 있으면 (Xvfb) headless=False 로 실행 → 시스템 클립보드 사용 가능
+    """
+    # Xvfb가 있으면 headless=False (실제 X11 클립보드 사용)
+    # 없으면 설정값(HEADLESS) 사용
+    xvfb_active = bool(os.environ.get("DISPLAY"))
+    use_headless = False if xvfb_active else HEADLESS
+    logger.info(f"브라우저 headless={use_headless} (DISPLAY={os.environ.get('DISPLAY','없음')})")
+
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+    ]
+    # 1) Chromium
+    try:
+        browser = await p.chromium.launch(headless=use_headless, args=chromium_args)
+        logger.info("브라우저: Chromium")
+        return browser, "chromium"
+    except Exception as e:
+        if not _is_missing_lib_error(e):
+            raise
+        logger.warning("Chromium 라이브러리 없음, Firefox 시도 중...")
+
+    # 2) Firefox
+    try:
+        browser = await p.firefox.launch(
+            headless=HEADLESS,
+            firefox_user_prefs={
+                "network.captive-portal-service.enabled": False,
+                "browser.tabs.remote.autostart": False,
+            },
+        )
+        logger.info("브라우저: Firefox")
+        return browser, "firefox"
+    except Exception as e:
+        logger.error(f"Firefox 실행 오류 상세: {e}")
+        if not _is_missing_lib_error(e):
+            raise
+        raise BrowserUnavailableError(
+            "Chromium/Firefox 모두 실행 불가. 시스템 라이브러리 부족.\n"
+            f"Firefox 오류: {e}"
+        ) from e
+
+
+async def post_to_naver_blog(title, content_html, tags, category, blog_config):
+    """
+    네이버 블로그에 글 포스팅
+    blog_config: BLOGS dict의 개별 블로그 설정
+    """
+    # Xvfb 가상 디스플레이 시작 (Docker 환경에서 시스템 클립보드 사용 가능하게)
+    _ensure_xvfb()
+
+    # 실행마다 고유 폴더에 스크린샷 저장 (예: 20260326_153012)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{blog_config.get('blog_id','')}"
+
+    async with async_playwright() as p:
+        browser, browser_type = await _launch_browser(p)
+
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=ua if browser_type == "chromium" else None,
+            locale="ko-KR",
+        )
+
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        """)
+
+        page = await context.new_page()
+
+        # 브라우저 다이얼로그 처리
+        # beforeunload = 발행 후 페이지 이탈 → accept()로 허용
+        # 나머지(alert 등) = dismiss()로 닫기
+        _alert_triggered = {"value": False}
+
+        async def _on_dialog(dialog):
+            if dialog.type == "beforeunload":
+                logger.info("브라우저 다이얼로그: [beforeunload] 발행 후 이탈 허용")
+                await dialog.accept()
+            else:
+                logger.warning(f"브라우저 다이얼로그: [{dialog.type}] {dialog.message}")
+                _alert_triggered["value"] = True
+                await dialog.dismiss()
+        page.on("dialog", _on_dialog)
+
+        try:
+            # 1. 쿠키로 로그인 시도
+            logged_in = await login_with_cookies(context, page, blog_config)
+
+            # 2. 쿠키 만료 시 ID/PW 로그인
+            if not logged_in:
+                logged_in = await login_with_password(page, blog_config)
+                if not logged_in:
+                    return False
+                cookies = await context.cookies()
+                save_cookies(cookies, blog_config["cookie_file"])
+
+            # 3. 글쓰기 페이지로 직접 이동
+            # 旧) 블로그 홈 -> 글쓰기 버튼 클릭 방식은 불안정하여 URL로 직접 이동
+            write_url = f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_config['blog_id']}"
+            
+            logger.info(f"[{blog_config['name']}] 글쓰기 페이지로 이동: {write_url}")
+            _alert_triggered["value"] = False
+            await page.goto(write_url, wait_until="domcontentloaded", timeout=25000)
+            await page.wait_for_timeout(3000)
+            # alert은 dismiss 후 자동으로 write form으로 진행되므로 별도 재이동 불필요
+            if _alert_triggered["value"]:
+                logger.info("alert 감지 (임시저장 글 복원 실패) → 현재 페이지에서 계속 진행")
+                _alert_triggered["value"] = False
+                await page.wait_for_timeout(2000)  # alert dismiss 후 페이지 정착 대기
+
+            # 쿠키 만료로 로그인 페이지로 리다이렉트된 경우 재로그인
+            if "nidlogin" in page.url or ("naver.com" in page.url and "login" in page.url.lower()):
+                logger.warning(f"[{blog_config['name']}] 쿠키 만료 감지 (로그인 페이지 리다이렉트) → ID/PW 재로그인")
+                logged_in = await login_with_password(page, blog_config)
+                if not logged_in:
+                    logger.error(f"[{blog_config['name']}] ID/PW 재로그인 실패")
+                    return False
+                cookies = await context.cookies()
+                save_cookies(cookies, blog_config["cookie_file"])
+                await page.goto(write_url, wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+                if len(context.pages) > 1:
+                    page = context.pages[-1]
+                    await page.wait_for_load_state("domcontentloaded")
+                    await page.wait_for_timeout(3000)
+                logger.info(f"[{blog_config['name']}] 재로그인 후 글쓰기 페이지: {page.url}")
+
+            # 에디터 로드 대기 (새 SmartEditor는 iframe 없이 직접 렌더링)
+            # wait_for_selector 대신 고정 대기 + JS 확인으로 안정성 확보
+            main_frame = None
+            editor_loaded = False
+            logger.info("에디터 로드 대기 중 (8초)...")
+            await page.wait_for_timeout(8000)
+
+            # "작성 중인 글" 팝업 JS로 닫기 (page 컨텍스트) - '새 글 쓰기' 우선
+            try:
+                dismissed = await page.evaluate("""
+                    () => {
+                        var LABELS = ['새 글 쓰기', '새글 쓰기', '새 글쓰기', '취소', '닫기'];
+                        var btns = Array.from(document.querySelectorAll('button'));
+                        for (var label of LABELS) {
+                            var btn = btns.find(b => b.textContent.trim() === label
+                                && b.offsetParent !== null);
+                            if (btn) { btn.click(); return 'dismissed:' + label; }
+                        }
+                        return 'no_popup';
+                    }
+                """)
+                if dismissed.startswith('dismissed'):
+                    logger.info(f"'작성 중인 글' 팝업 처리: {dismissed}")
+                    await page.wait_for_timeout(1500)
+            except Exception as e:
+                logger.warning(f"팝업 JS 닫기 예외: {e}")
+
+            # 도움말 패널 닫기 (우측 패널이 에디터 클릭 방해)
+            try:
+                closed = await page.evaluate("""
+                    () => {
+                        var closeBtn = document.querySelector('.help_close, [aria-label="닫기"], button.ico_close');
+                        if (!closeBtn) {
+                            closeBtn = Array.from(document.querySelectorAll('button')).find(
+                                b => b.closest('.help_panel, .se-help-panel, [class*="help"]')
+                            );
+                        }
+                        if (closeBtn) { closeBtn.click(); return 'closed'; }
+                        return 'no_panel';
+                    }
+                """)
+                if closed == 'closed':
+                    logger.info("도움말 패널 닫기 완료")
+                    await page.wait_for_timeout(800)
+            except Exception:
+                pass
+
+            # 에디터 존재 확인 (새 SmartEditor: 직접 렌더링)
+            try:
+                editor_check = await page.evaluate("""
+                    () => {
+                        return !!(
+                            document.querySelector('.se-title-text') ||
+                            document.querySelector('.se-placeholder') ||
+                            document.querySelector('[class*="se-title"]')
+                        );
+                    }
+                """)
+                if editor_check:
+                    editor_loaded = True
+                    logger.info("✅ 에디터 직접 로드 확인 (새 SmartEditor)")
+            except Exception as e:
+                logger.warning(f"에디터 JS 확인 예외: {e}")
+
+            # 구버전: iframe[name="mainFrame"] 확인
+            if not editor_loaded:
+                main_frame = page.frame(name="mainFrame")
+                if main_frame:
+                    logger.info(f"mainFrame 로드 완료: {main_frame.url[:60]}")
+                    editor_loaded = True
+
+            if not editor_loaded:
+                logger.error("에디터를 찾지 못했습니다.")
+                await _screenshot(page, "error_mainframe_timeout", run_id)
+                return False
+
+            frame_info = [(f.name or "noname", f.url[:60]) for f in page.frames]
+            logger.info(f"로드된 frames({len(frame_info)}개): {frame_info}")
+
+            # blogNo 선행 추출 (write form 컨텍스트에서만 가능 → 이후 페이지 이동 전에 저장)
+            _js_ctx_for_blog_no = main_frame if main_frame else page
+            _blog_no_for_ajax = ""
+            try:
+                _blog_no_for_ajax = await _js_ctx_for_blog_no.evaluate("""
+                    () => {
+                        if (window.__blogNo) return String(window.__blogNo);
+                        if (window.nts_blog && window.nts_blog.blogNo)
+                            return String(window.nts_blog.blogNo);
+                        for (var s of Array.from(document.scripts)) {
+                            var m = s.text.match(/"blogNo"\\s*:\\s*"?(\\d+)"?/);
+                            if (m) return m[1];
+                            var m2 = s.text.match(/blogNo\\s*=\\s*['"]?(\\d+)['"]?/);
+                            if (m2) return m2[1];
+                        }
+                        return '';
+                    }
+                """)
+                logger.info(f"[blogNo] 사전 추출: '{_blog_no_for_ajax}'")
+            except Exception as e:
+                logger.warning(f"[blogNo] 사전 추출 실패: {e}")
+
+            # [스크린샷 1] 글쓰기 페이지 로드 직후
+            await _screenshot(page, "01_write_page_loaded", run_id)
+
+            # 3-1. "작성 중인 글이 있습니다" HTML 팝업 처리
+            # (브라우저 native dialog가 아닌 HTML 모달 → page.on("dialog") 미처리)
+            await _dismiss_draft_popup(main_frame, page)
+            await page.wait_for_timeout(800)
+
+            # 3-2. SmartEditor ONE 본문 영역 로드 완료 대기
+            # (초안 팝업 없는 계정은 대기 없이 바로 진행 → 에디터 미초기화 상태로 클릭)
+            editor_ctx = main_frame if main_frame else page
+            try:
+                await editor_ctx.wait_for_selector(
+                    '.se-placeholder, .se-component.se-text',
+                    timeout=8000
+                )
+                await page.wait_for_timeout(1000)
+                logger.info("SmartEditor 본문 영역 로드 완료")
+            except Exception:
+                logger.warning("SmartEditor 본문 영역 로드 대기 타임아웃, 계속 진행")
+
+            # 4. 제목 입력
+            await _enter_title(main_frame, page, title)
+            await page.wait_for_timeout(1500)
+
+            # [스크린샷 2] 제목 입력 후
+            await _screenshot(page, "02_after_title", run_id)
+
+            # 5. 본문 입력
+            # 해시태그는 본문에 붙이지 않고, API tag 필드로만 전달한다.
+            content_with_tags = content_html
+
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()][:10]
+            tag_list_str = ",".join(tag_list)
+
+            logger.info(f"본문 내용 확인 (앞 300자): {content_with_tags[:300]}")
+            logger.info(f"본문 총 길이: {len(content_with_tags):,} bytes")
+            logger.info(f"전송 태그: {tag_list_str}")
+
+            content_inserted = await _enter_content(main_frame, page, content_with_tags)
+            await page.wait_for_timeout(1500)
+
+            # [스크린샷 3] 본문 입력 후
+            await _screenshot(page, "03_after_content", run_id)
+
+            success = False
+            import re as _re
+
+            published_log_no = None
+
+            if content_inserted:
+                # ── 경로 A: SmartEditor에 삽입 성공 → 발행 버튼 클릭 시도 ──
+                logger.info("✅ SmartEditor 삽입 성공 → 발행 버튼 클릭 시도")
+                ui_publish_ok = await _publish(page, run_id, category=category)
+                if ui_publish_ok:
+                    # _publish 내부에서 PostView 리다이렉트 대기 완료
+                    await _screenshot(page, "04_after_publish", run_id)
+
+                    if "PostView" in page.url:
+                        logger.info(f"[{blog_config['name']}] ✅ UI 발행 성공 (PostView 리다이렉트): {page.url}")
+                        cookies = await context.cookies()
+                        save_cookies(cookies, blog_config["cookie_file"])
+                        await _screenshot(page, "06_after_publish", run_id)
+                        return True
+
+                    # PostView 리다이렉트 없음 → 블로그 홈에서 제목 검증
+                    logger.info(f"PostView 리다이렉트 없음 (현재: {page.url[:80]}) → 블로그 홈에서 직접 검증")
+                    verified = await _verify_posted(page, blog_config['blog_id'], title)
+                    if verified:
+                        logger.info(f"[{blog_config['name']}] ✅ UI 발행 + 블로그 검증 성공: {title[:40]}")
+                        cookies = await context.cookies()
+                        save_cookies(cookies, blog_config["cookie_file"])
+                        await _screenshot(page, "06_after_publish", run_id)
+                        return True
+                    logger.warning(f"블로그 검증 실패 → PostSaveAjax 폴백")
+                else:
+                    logger.warning("❌ UI 발행 버튼 클릭 실패 → PostSaveAjax 폴백")
+
+            # ── 경로 B: PostSaveAjax 직접 호출 (UI 삽입 실패 또는 UI 발행 실패) ──
+            if content_inserted:
+                logger.info("PostSaveAjax API 직접 호출 (UI 발행 폴백)")
+            else:
+                logger.warning("SmartEditor 삽입 실패 → PostSaveAjax API 직접 호출 (폴백)")
+
+            tag_list_str = tags
+            blog_id_str = blog_config["blog_id"]
+
+            # PostSaveAjax는 blog.naver.com 컨텍스트에서 실행해야 쿠키가 포함됨
+            # write form 페이지가 아니라면 복귀
+            if "PostWriteForm" not in page.url and "blog.naver.com" in page.url:
+                write_url_back = f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_config['blog_id']}"
+                logger.info(f"PostSaveAjax 전 write form 복귀: {write_url_back}")
+                try:
+                    await page.goto(write_url_back, wait_until="domcontentloaded", timeout=20000)
+                    await page.wait_for_timeout(3000)
+                    # 팝업 닫기
+                    await page.evaluate("""
+                        () => {
+                            var btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '취소');
+                            if (btn) btn.click();
+                        }
+                    """)
+                    await page.wait_for_timeout(1000)
+                except Exception as nav_e:
+                    logger.warning(f"write form 복귀 실패: {nav_e}")
+
+            # blogNo: write form에서 미리 추출한 값 사용 (페이지 이동 후에도 유효)
+            blog_no = _blog_no_for_ajax
+            logger.info(f"[PostSaveAjax] blogNo: '{blog_no}'")
+
+            # categoryNo: 블로그 카테고리 API에서 동적 조회
+            category_no = await _get_category_no(page, blog_config['blog_id'], category)
+            logger.info(f"[PostSaveAjax] categoryNo: '{category_no}' (category='{category}')")
+
+            logger.info(f"[PostSaveAjax] 호출 시작 (title={title[:30]}, "
+                       f"contents={len(content_with_tags):,}bytes)")
+
+            # 네이버 블로그 POST API: 여러 엔드포인트를 순서대로 시도
+            # PostSaveAjax.naver가 404이면 새 REST API 시도
+            fetch_result = await page.evaluate("""
+                async ({title, contents, blogId, blogNo, categoryNo, tags, referer}) => {
+                    const buildParams = () => {
+                        const params = new URLSearchParams();
+                        params.append('blogId',              blogId);
+                        params.append('blogNo',              blogNo);
+                        params.append('logNo',               '0');
+                        params.append('title',               title);
+                        params.append('contents',            contents);
+                        params.append('categoryNo',          categoryNo);
+                        params.append('tag',                 tags);
+                        params.append('type',                'post');
+                        params.append('status',              'publish');
+                        params.append('useRssYN',            'Y');
+                        params.append('allowComment',        'true');
+                        params.append('allowLike',           'true');
+                        params.append('allowExternalSearch', 'true');
+                        params.append('addCategoryYN',       'N');
+                        params.append('addContents',         '');
+                        params.append('publishDate',         '');
+                        params.append('publishTime',         '');
+                        params.append('cclUploadLicense',    '');
+                        params.append('cclCommercial',       '');
+                        params.append('cclModification',     '');
+                        return params;
+                    };
+
+                    const commonHeaders = {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Referer': referer || window.location.href,
+                        'Origin': 'https://blog.naver.com',
+                    };
+
+                    // 시도할 엔드포인트 목록 (우선순위 순)
+                    const endpoints = [
+                        'https://blog.naver.com/PostSaveAjax.naver',
+                        'https://blog.naver.com/api/blogs/' + blogId + '/post-write/posts',
+                        'https://blog.naver.com/PostSave.naver',
+                    ];
+
+                    for (var i = 0; i < endpoints.length; i++) {
+                        try {
+                            const url = endpoints[i];
+                            const isRest = url.includes('/api/blogs/');
+                            let body, headers;
+
+                            if (isRest) {
+                                // REST API: JSON 바디
+                                headers = {...commonHeaders, 'Content-Type': 'application/json'};
+                                body = JSON.stringify({
+                                    title, contents, categoryNo, tag: tags,
+                                    status: 'publish', allowComment: true,
+                                    allowExternalSearch: true, useRssYN: 'Y',
+                                });
+                            } else {
+                                headers = commonHeaders;
+                                body = buildParams().toString();
+                            }
+
+                            const resp = await fetch(url, {
+                                method: 'POST',
+                                headers,
+                                credentials: 'include',
+                                body,
+                            });
+                            const text = await resp.text();
+                            console.log('[PostSave] endpoint=' + url + ' status=' + resp.status);
+
+                            if (resp.status === 404) {
+                                console.warn('[PostSave] 404 → 다음 엔드포인트 시도');
+                                continue;
+                            }
+                            return {ok: resp.ok, status: resp.status,
+                                    text: text.substring(0, 2000), endpoint: url};
+                        } catch(e) {
+                            console.warn('[PostSave] 오류: ' + e.message);
+                        }
+                    }
+                    return {ok: false, status: 0,
+                            text: '모든 엔드포인트 실패', endpoint: 'none'};
+                }
+            """, {
+                "title":      title,
+                "contents":   content_with_tags,
+                "blogId":     blog_id_str,
+                "blogNo":     blog_no,
+                "categoryNo": category_no,
+                "tags":       tag_list_str,
+                "referer":    page.url,
+            })
+            logger.info(f"[PostSaveAjax] 사용된 엔드포인트: {fetch_result.get('endpoint','?')}")
+
+            logger.info(f"[PostSaveAjax] 응답: status={fetch_result['status']}, "
+                       f"text={fetch_result['text'][:500]}")
+
+            fetch_text = fetch_result.get("text", "")
+            fetch_ok   = fetch_result.get("ok", False)
+            published_log_no = None
+
+            log_no_match = _re.search(r'"logNo"\s*:\s*"?(\d+)"?', fetch_text)
+            success = (
+                log_no_match is not None or
+                "SUCCESS" in fetch_text.upper() or
+                (fetch_ok and "error" not in fetch_text.lower() and fetch_result['status'] == 200)
+            )
+
+            if log_no_match:
+                published_log_no = log_no_match.group(1)
+                logger.info(f"[PostSaveAjax] ✅ 발행 성공! logNo={published_log_no} "
+                           f"→ https://blog.naver.com/{blog_id_str}/{published_log_no}")
+            elif success:
+                logger.info("[PostSaveAjax] ✅ 발행 성공 (200 OK)")
+            else:
+                logger.error(f"[PostSaveAjax] ❌ 발행 실패: {fetch_text[:300]}")
+                # PostSaveAjax가 404로 실패해도 UI confirm 버튼이 실제로 작동했을 수 있음
+                # (RabbitWrite 캡처 타이밍 미스 등) → 블로그에서 직접 확인
+                logger.info("[PostSaveAjax] 실패 후 블로그 직접 확인 시도...")
+                ajax_fallback_verified = await _verify_posted(page, blog_config['blog_id'], title)
+                if ajax_fallback_verified:
+                    logger.info(f"✅ PostSaveAjax 실패했지만 블로그 확인 성공: {title[:40]}")
+                    cookies = await context.cookies()
+                    save_cookies(cookies, blog_config["cookie_file"])
+                    await _screenshot(page, "06_after_publish", run_id)
+                    return True
+
+            # [스크린샷] 발행 후 최종 상태
+            await _screenshot(page, "06_after_publish", run_id)
+
+            if success:
+                cookies = await context.cookies()
+                save_cookies(cookies, blog_config["cookie_file"])
+
+                # 7. 실제 블로그에서 포스팅 검증
+                verified = await _verify_posted(page, blog_config['blog_id'], title, published_log_no)
+                if verified:
+                    logger.info(f"[{blog_config['name']}] ✅ 포스팅 확인 완료: {title}")
+                else:
+                    logger.error("Post publish response succeeded but strict verification failed")
+                    await _screenshot(page, "07_verify_failed", run_id)
+                    return False
+                    # 발행 버튼 클릭 자체가 성공했으면 성공으로 처리 (iframe 검증 한계)
+
+            logger.info(f"[스크린샷 폴더] {SCREENSHOT_DIR}/{run_id}/")
+            return success
+
+        except PlaywrightTimeout as e:
+            logger.error(f"[{blog_config['name']}] 타임아웃 오류: {e}")
+            await _screenshot(page, "error_timeout", run_id)
+            return False
+        except Exception as e:
+            logger.error(f"[{blog_config['name']}] 포스팅 오류: {e}", exc_info=True)
+            await _screenshot(page, "error_exception", run_id)
+            return False
+        finally:
+            await page.wait_for_timeout(1000)
+            await browser.close()
+
+
+# ─────────────────────────────────────────
+# 세부 동작 함수들
+# ─────────────────────────────────────────
+
+async def _verify_posted(page, blog_id: str, title: str, log_no: str | None = None) -> bool:
+    """
+    Verify that the newly published post is actually visible on Naver blog.
+    Strict mode: no fallback based on "recent post count".
+    """
+    try:
+        # 1) If logNo is known, verify direct post URL first (most reliable).
+        if log_no:
+            direct_url = f"https://blog.naver.com/{blog_id}/{log_no}"
+            logger.info(f"Direct URL verify: {direct_url}")
+            await page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            direct_content = await page.content()
+            if title in direct_content:
+                logger.info(f"✅ Direct URL verification succeeded: {title}")
+                return True
+
+        # 2) Current page must be a real PostView URL to count as success.
+        current_url = page.url
+        if "PostView.naver" in current_url:
+            logger.info(f"✅ PostView redirect confirmed: {current_url}")
+            return True
+
+        # 3) Open blog home and check exact title in mainFrame/page source.
+        blog_url = f"https://blog.naver.com/{blog_id}"
+        logger.info(f"Blog verification start: {blog_url}")
+        await page.goto(blog_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+
+        main_frame = page.frame(name="mainFrame")
+        if main_frame:
+            try:
+                await main_frame.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            iframe_content = await main_frame.content()
+            if title in iframe_content:
+                logger.info(f"✅ mainFrame title match: {title}")
+                return True
+
+        content = await page.content()
+        if title in content:
+            logger.info(f"✅ page source title match: {title}")
+            return True
+
+        logger.warning(f"⚠️ posted-title not found on blog: {title}")
+        return False
+
+    except Exception as e:
+        logger.error(f"Blog verification error: {e}")
+        return False
+
+async def _dismiss_draft_popup(frame, page=None):
+    """'작성 중인 글이 있습니다' HTML 팝업 처리.
+
+    새 글을 발행할 것이므로 임시저장 초안은 버리고 '새 글 쓰기'를 선택.
+    '새 글 쓰기' 버튼이 없으면 '취소' → '닫기' 순으로 시도.
+    frame=None 이면 page 컨텍스트에서만 시도.
+    """
+    _POPUP_JS = """
+        () => {
+            var LABELS_DISCARD = ['새 글 쓰기', '새글 쓰기', '새 글쓰기', '취소', '닫기'];
+            var btns = Array.from(document.querySelectorAll('button'));
+            for (var label of LABELS_DISCARD) {
+                var btn = btns.find(b => b.textContent.trim() === label
+                    && b.offsetParent !== null);
+                if (btn) { btn.click(); return 'dismissed:' + label; }
+            }
+            return 'no_popup';
+        }
+    """
+    contexts = []
+    if frame:
+        contexts.append(("frame", frame))
+    if page:
+        contexts.append(("page", page))
+
+    for ctx_name, ctx in contexts:
+        try:
+            result = await ctx.evaluate(_POPUP_JS)
+            if result.startswith('dismissed'):
+                logger.info(f"작성 중인 글 팝업 처리 ({ctx_name}): {result}")
+                return
+        except Exception:
+            pass
+
+
+async def _enter_title(frame, page, title):
+    """제목 입력 (frame 컨텍스트에서 실행, frame=None이면 page 직접 사용)"""
+    ctx = frame if frame else page  # 새 SmartEditor: iframe 없이 page에서 직접 탐색
+
+    selectors = [
+        '.se-title-text', '.se-title-input',
+        'div[contenteditable="true"][class*="title"]'
+    ]
+    for sel in selectors:
+        try:
+            locator = ctx.locator(sel).first
+            if await locator.count() > 0:
+                await locator.click(timeout=5000)
+                await page.keyboard.press("Control+a")
+                await page.keyboard.type(title, delay=50)
+                logger.info(f"제목 입력 완료: {title[:30]} (selector: {sel})")
+                return
+        except Exception:
+            continue
+    logger.error("모든 selector로 제목 입력 실패. 스크린샷을 확인하세요.")
+
+
+async def _enter_content(frame, page, content_html):
+    """본문 입력 (frame 컨텍스트에서 실행, frame=None이면 page 직접 사용)
+
+    시도 순서:
+    -1. SmartEditor JS API setContents() 직접 주입 (서식 보존 최우선)
+     0. win32clipboard CF_HTML (Windows + pywin32)
+     1. xclip + Ctrl+V (Linux X11/Xvfb)
+     2. keyboard.type — HTML 태그 strip 후 plain text 입력 (서식 손실)
+     3. navigator.clipboard + Ctrl+V
+     4. pyperclip plain text
+    """
+    ctx = frame if frame else page
+
+    try:
+        body_selector = '.se-placeholder, .se-component:not(.se-component-title)'
+        await ctx.locator(body_selector).first.click(timeout=10000, force=True)
+        logger.info(f"본문 영역 클릭 완료: {body_selector}")
+        await page.wait_for_timeout(500)
+    except Exception:
+        logger.warning("본문 영역 클릭 실패, 계속 진행")
+
+    paste_success = False
+
+    # 에디터 본문 영역 텍스트 길이 확인 JS
+    # title 클래스가 없는 contenteditable 요소의 텍스트 합산
+    _EDITOR_LEN_JS = """
+        () => {
+            var eds = Array.from(document.querySelectorAll('[contenteditable="true"]'));
+            var total = 0;
+            for (var ed of eds) {
+                if (ed.contentEditable !== 'true') continue;
+                var cls = (ed.className || '').toLowerCase();
+                // 제목 입력 영역 제외
+                if (cls.includes('title')) continue;
+                // data-placeholder 가 제목 관련이면 제외
+                var ph = (ed.getAttribute('data-placeholder') || '').toLowerCase();
+                if (ph.includes('제목') || ph.includes('title')) continue;
+                total += ed.innerText.trim().length;
+            }
+            return total;
+        }
+    """
+
+    # ── 방법 -1: SmartEditor JS API 직접 주입 (1순위) ──────────────
+    # SmartEditor ONE은 내부 인스턴스에 setContents() API를 노출하는 경우가 있음.
+    # HTML을 클립보드 없이 직접 주입 → 서식(굵게/표/링크) 보존 가능.
+    if not paste_success:
+        try:
+            result = await ctx.evaluate("""
+                (html) => {
+                    // SmartEditor ONE 인스턴스 탐색 (전역 변수 또는 DOM 기반)
+                    var editor =
+                        window.se2 ||
+                        window.__smartEditor ||
+                        window.smartEditor ||
+                        (window.nhn && window.nhn.husky && window.nhn.husky.SmartEditor2 &&
+                         window.nhn.husky.SmartEditor2.getInstance &&
+                         window.nhn.husky.SmartEditor2.getInstance('ir1')) ||
+                        null;
+
+                    // 전역 탐색으로 찾지 못한 경우 window 속성 순회
+                    if (!editor) {
+                        for (var key in window) {
+                            try {
+                                var v = window[key];
+                                if (v && typeof v === 'object' && typeof v.setContents === 'function') {
+                                    editor = v;
+                                    break;
+                                }
+                            } catch(e) {}
+                        }
+                    }
+
+                    if (!editor || typeof editor.setContents !== 'function') {
+                        return 'no_api';
+                    }
+                    editor.setContents(html);
+                    return 'ok';
+                }
+            """, content_html)
+
+            if result == 'ok':
+                await page.wait_for_timeout(1000)
+                ed_len = await ctx.evaluate(_EDITOR_LEN_JS)
+                if ed_len > 10:
+                    logger.info(f"✅ 본문 입력 완료 (SmartEditor JS API, {ed_len}자)")
+                    paste_success = True
+                else:
+                    logger.warning(f"SmartEditor JS API 호출 후 에디터 {ed_len}자 → 다음 방법 시도")
+            else:
+                logger.info(f"SmartEditor JS API 미노출 ({result}) → 다음 방법 시도")
+        except Exception as e:
+            logger.warning(f"SmartEditor JS API 방식 실패: {e}")
+
+    # ── 방법 0: win32clipboard CF_HTML (Windows 전용) ────────────
+    if not paste_success and sys.platform == "win32":
+        try:
+            import win32clipboard
+            cf_html_data = _build_cf_html(content_html)
+            CF_HTML = win32clipboard.RegisterClipboardFormat("HTML Format")
+            win32clipboard.OpenClipboard(0)
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(CF_HTML, cf_html_data)
+            win32clipboard.CloseClipboard()
+            await page.keyboard.press("Control+V")
+            await page.wait_for_timeout(2500)
+            ed_len = await ctx.evaluate(_EDITOR_LEN_JS)
+            if ed_len > 30:
+                logger.info(f"✅ 본문 입력 완료 (win32clipboard CF_HTML, {ed_len}자)")
+                paste_success = True
+            else:
+                logger.warning(f"win32clipboard CF_HTML 후 에디터 {ed_len}자 → 다음 방법 시도")
+        except ImportError:
+            logger.info("win32clipboard(pywin32) 없음 → 다음 방법 시도")
+        except Exception as e:
+            logger.warning(f"win32clipboard 방식 실패: {e}")
+
+    # ── 방법 1: xclip (Linux/Xvfb) ──────────────────────────────
+    if not paste_success and bool(os.environ.get("DISPLAY")) and _xclip_write(content_html):
+        try:
+            await page.keyboard.press("Control+V")
+            await page.wait_for_timeout(2500)
+            ed_len = await ctx.evaluate(_EDITOR_LEN_JS)
+            if ed_len > 30:
+                logger.info(f"✅ 본문 입력 완료 (xclip + Ctrl+V 방식, {ed_len}자)")
+                paste_success = True
+            else:
+                logger.warning(f"xclip Ctrl+V 후 에디터 {ed_len}자")
+        except Exception as e:
+            logger.warning(f"xclip Ctrl+V 실패: {e}")
+
+    # ── 방법 2: keyboard.type (SmartEditor React 상태 직접 업데이트) ─
+    # navigator.clipboard/execCommand 는 DOM만 수정 → React 상태 미반영 → 발행 시 빈 글
+    # keyboard.type 는 실제 key event → SmartEditor React 상태 반영 → 발행 성공 확인됨
+    if not paste_success:
+        try:
+            import re as _re_t
+            plain = content_html.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+            plain = _re_t.sub(r'<[^>]+>', '', plain).strip()
+
+            # Playwright locator 클릭으로 SmartEditor 본문 포커스 (JS 클릭은 이벤트 핸들러 미발동)
+            # .se-placeholder → 빈 편집 상태, 클릭 시 SmartEditor가 contenteditable 생성
+            body_clicked = False
+            for body_sel in ['.se-placeholder', '.se-component:not(.se-component-title)']:
+                try:
+                    loc = ctx.locator(body_sel).first
+                    if await loc.count() > 0:
+                        await loc.click(timeout=3000)
+                        await page.wait_for_timeout(600)  # SmartEditor 반응 대기
+                        body_clicked = True
+                        logger.info(f"keyboard.type: 본문 클릭 ({body_sel})")
+                        break
+                except Exception:
+                    pass
+            if not body_clicked:
+                # 좌표 클릭 폴백 (에디터 중앙부)
+                await page.mouse.click(640, 400)
+                await page.wait_for_timeout(600)
+                logger.info("keyboard.type: 좌표 클릭 (640, 400)")
+
+            # 최대 3000자 타이핑 (5ms/자 → 약 15초)
+            await page.keyboard.type(plain[:3000], delay=5)
+            await page.wait_for_timeout(800)
+
+            # 성공 확인: 플레이스홀더 사라짐 = 컨텐츠 입력됨
+            placeholder_gone = await ctx.evaluate("""
+                () => {
+                    var ph = document.querySelector('.se-placeholder');
+                    return !ph || ph.style.display === 'none' || ph.offsetParent === null;
+                }
+            """)
+            ed_len = await ctx.evaluate(_EDITOR_LEN_JS)
+            body_len = await ctx.evaluate("document.body.innerText.trim().length")
+            logger.info(f"keyboard.type 후: placeholder_gone={placeholder_gone}, ed_len={ed_len}, body_len={body_len}")
+
+            if placeholder_gone or ed_len > 30 or body_len > 500:
+                logger.info(f"✅ 본문 입력 완료 (keyboard.type, ed={ed_len}자, body={body_len}자)")
+                paste_success = True
+            else:
+                logger.warning(f"keyboard.type 후 에디터 {ed_len}자, body {body_len}자, placeholder_gone={placeholder_gone}")
+        except Exception as e:
+            logger.error(f"keyboard.type 방식 실패: {e}")
+
+    # ── 방법 3: navigator.clipboard API (HTML 붙여넣기) ─────────
+    if not paste_success:
+        try:
+            await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+            await ctx.evaluate("""async (html) => {
+                const htmlBlob = new Blob([html], {type: 'text/html'});
+                const textBlob = new Blob([html.replace(/<[^>]+>/g, ' ')], {type: 'text/plain'});
+                await navigator.clipboard.write([new ClipboardItem({'text/html': htmlBlob, 'text/plain': textBlob})]);
+            }""", content_html)
+            await page.keyboard.press("Control+V")
+            await page.wait_for_timeout(2500)
+            ed_len = await ctx.evaluate(_EDITOR_LEN_JS)
+            if ed_len > 30:
+                logger.info(f"✅ 본문 입력 완료 (navigator.clipboard + Ctrl+V, {ed_len}자)")
+                paste_success = True
+            else:
+                logger.warning(f"navigator.clipboard + Ctrl+V 후 에디터 {ed_len}자")
+        except Exception as e:
+            logger.warning(f"navigator.clipboard 방식 실패: {e}")
+
+    # ── 방법 4: pyperclip (Windows 네이티브 클립보드, plain text) ─
+    if not paste_success:
+        try:
+            import pyperclip
+            import re as _re2
+            plain2 = content_html.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+            plain2 = _re2.sub(r'<[^>]+>', '', plain2)
+            pyperclip.copy(plain2)
+            await page.keyboard.press("Control+V")
+            await page.wait_for_timeout(2500)
+            ed_len = await ctx.evaluate(_EDITOR_LEN_JS)
+            if ed_len > 30:
+                logger.info(f"✅ 본문 입력 완료 (pyperclip + Ctrl+V, plain text, {ed_len}자)")
+                paste_success = True
+            else:
+                logger.warning(f"pyperclip Ctrl+V 후 에디터 {ed_len}자")
+        except ImportError:
+            logger.warning("pyperclip 없음 → 다음 방법 시도")
+        except Exception as e:
+            logger.warning(f"pyperclip 방식 실패: {e}")
+
+    return paste_success
+
+
+async def _publish(page, run_id: str = "", category: str = ""):
+    """
+    발행 흐름:
+      1) JS evaluate로 헤더 '발행' 버튼 클릭 (패널 열기)
+      1.5) 발행 패널에서 카테고리 선택 (category 인수가 있을 때)
+      2) confirm_btn__* 로케이터로 확인 버튼 click(force=True)
+         force=True → pointer-events 오버레이(도움말 패널 등) 우회
+      3) JS evaluate 폴백 (React synthetic event dispatch)
+    """
+
+    # ── POST 요청 캡처 리스너 (발행 전에 등록) ──────────────────────
+    _captured_posts: list = []
+
+    def _on_request(request):
+        if request.method == "POST":
+            try:
+                payload = request.post_data or ""
+            except Exception:
+                payload = "(payload 읽기 실패)"
+            _captured_posts.append({"url": request.url, "payload": payload[:500]})
+            logger.info(f"[POST 캡처] {request.url}\n  payload: {payload[:500]}")
+
+    page.on("request", _on_request)
+
+    # ── Step 1. 헤더 '발행' 버튼 JS 클릭 (패널 열기) ────────────────
+    # 본문 입력 후 스크롤이 내려가 있을 수 있으므로 맨 위로 스크롤
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(500)
+
+    # publish_btn__* (70x30) 을 우선 탐색, 없으면 텍스트 기반
+    open_result = await page.evaluate("""
+        () => {
+            // publish_btn_area(컨테이너)를 제외하고 실제 버튼만 탐색
+            // publish_btn__m9KHH 같은 실제 <button> 태그 우선
+            var btn = Array.from(document.querySelectorAll('button[class*="publish_btn"]'))
+                .find(b => !b.className.includes('publish_btn_area')
+                        && b.getBoundingClientRect().width > 0);
+            if (!btn) {
+                btn = Array.from(document.querySelectorAll('button'))
+                    .find(b => b.textContent.trim() === '발행' &&
+                               b.getBoundingClientRect().width > 0);
+            }
+            if (btn) { btn.click(); return btn.className; }
+            return null;
+        }
+    """)
+    if not open_result:
+        logger.error("'발행' 헤더 버튼을 DOM에서 찾지 못했습니다.")
+        await _screenshot(page, "error_publish_btn1_notfound", run_id)
+        return False
+
+    logger.info(f"'발행' 헤더 버튼 JS 클릭 (패널 열기): {open_result[:60]}")
+    await page.wait_for_timeout(500)  # 패널 애니메이션 시작 대기
+    # 패널 열림을 confirm 버튼 출현으로 확인 (최대 5초)
+    try:
+        await page.wait_for_selector(
+            '[class*="confirm_btn"], [class*="confirmBtn"], [class*="publish_confirm"]',
+            timeout=5000
+        )
+        logger.info("[publish] 발행 패널 열림 확인 (confirm 버튼 감지)")
+    except Exception:
+        logger.warning("[publish] 발행 패널 confirm 버튼 대기 타임아웃 → 고정 2초 대기")
+        await page.wait_for_timeout(2000)
+    await _screenshot(page, "04_after_publish_click", run_id)
+
+    # ── Step 1.5. 발행 패널 내 버튼 목록 로깅 (디버깅) + 카테고리 선택 ──
+    panel_debug = await page.evaluate("""
+        () => {
+            var btns = Array.from(document.querySelectorAll('button'));
+            return btns
+                .filter(b => b.getBoundingClientRect().width > 0)
+                .map(b => ({
+                    text: b.textContent.trim().substring(0, 20),
+                    cls: b.className.substring(0, 60),
+                    inHeaderArea: !!b.closest('[class*="publish_btn_area"]'),
+                }));
+        }
+    """)
+    logger.info(f"[발행 패널] 현재 가시 버튼 목록: {panel_debug}")
+
+    if category:
+        try:
+            cat_result = await page.evaluate("""
+                (categoryName) => {
+                    var selects = Array.from(document.querySelectorAll('select'));
+                    for (var sel of selects) {
+                        var opts = Array.from(sel.options);
+                        var opt = opts.find(o => o.text.trim() === categoryName);
+                        if (!opt) {
+                            var lower = categoryName.toLowerCase().split('_').join(' ').split('/').join(' ');
+                            opt = opts.find(o => o.text.toLowerCase().includes(lower)
+                                             || lower.includes(o.text.toLowerCase()));
+                        }
+                        if (opt) {
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                            return 'selected:' + opt.text + '=' + opt.value;
+                        }
+                    }
+                    var items = Array.from(document.querySelectorAll(
+                        '[class*="category"] li, [class*="category"] button, [class*="Category"] li'));
+                    var lower2 = categoryName.toLowerCase().split('_').join(' ').split('/').join(' ');
+                    for (var item of items) {
+                        var text = item.textContent.trim();
+                        if (text === categoryName || text.toLowerCase().includes(lower2)) {
+                            item.click();
+                            return 'clicked:' + text;
+                        }
+                    }
+                    return 'not_found';
+                }
+            """, category)
+            if cat_result.startswith(('selected:', 'clicked:')):
+                logger.info(f"[발행 패널] 카테고리 선택: {cat_result}")
+                await page.wait_for_timeout(500)
+            else:
+                logger.warning(f"[발행 패널] 카테고리 '{category}' 선택 실패: {cat_result}")
+        except Exception as e:
+            logger.warning(f"[발행 패널] 카테고리 선택 예외: {e}")
+
+    # ── Step 2. 발행 확인 버튼 클릭 ─────────────────────────────────
+    # 구조: publish_btn_area > publish_btn (패널열기) + confirm_btn (발행확인)
+    # publish_btn__m9KHH 는 제외, confirm_btn__WEaBq 는 클릭해야 함
+
+    # 도움말 패널이 confirm 버튼 위를 덮어 클릭을 막으므로 먼저 제거
+    try:
+        removed = await page.evaluate("""
+            () => {
+                // container__HW_tc (도움말 컨테이너) 숨기기
+                var help = document.querySelector('[class*="container__HW"]');
+                if (help) { help.style.display = 'none'; return 'removed'; }
+                // 도움말 닫기 버튼 클릭
+                var closeBtn = document.querySelector('.help_close, [aria-label="닫기"]');
+                if (closeBtn) { closeBtn.click(); return 'closed'; }
+                return 'no_help';
+            }
+        """)
+        logger.info(f"[confirm] 도움말 패널 처리: {removed}")
+        await page.wait_for_timeout(300)
+    except Exception as e:
+        logger.debug(f"[confirm] 도움말 패널 처리 예외: {e}")
+
+    confirm_clicked = False
+
+    # 2-A: confirm_btn 클래스 직접 클릭 (publish_btn 클래스는 제외)
+    confirm_selectors = [
+        '[class*="confirm_btn"]',
+        '[class*="confirmBtn"]',
+        '[class*="publish_confirm"]',
+        '[class*="publishConfirm"]',
+        '[class*="btn_publish"]',
+        '[class*="btnPublish"]',
+    ]
+    for sel in confirm_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                cls = await loc.get_attribute("class") or ""
+                # 패널 열기 버튼(publish_btn__*)은 제외, confirm_btn__*은 허용
+                if "publish_btn__" in cls and "confirm" not in cls:
+                    logger.debug(f"[confirm] 헤더 발행 버튼 건너뜀: {cls[:40]}")
+                    continue
+                # scroll into view 후 실제 클릭 (force=True는 React 이벤트 못 유발)
+                await loc.scroll_into_view_if_needed()
+                await page.wait_for_timeout(300)
+                await loc.click(timeout=5000)
+                logger.info(f"[confirm] Playwright 실제 클릭: {cls[:60]}")
+                confirm_clicked = True
+                break
+        except Exception as e:
+            logger.debug(f"confirm selector 실패 ({sel}): {e}")
+
+    # 2-B: JS로 패널 안의 '발행' 버튼 탐색 (헤더 버튼 명시적 제외)
+    if not confirm_clicked:
+        logger.warning("[confirm] locator 실패 → JS .click() 직접 호출")
+        # confirm_btn__WEaBq 처럼 publish_btn__ 가 아닌 버튼을 .click() 으로 직접 호출
+        fallback = await page.evaluate("""
+            () => {
+                var btns = Array.from(document.querySelectorAll('button'));
+                // publish_btn__ (패널 열기 버튼)은 제외, confirm_btn__ 는 허용
+                var btn = btns.find(b => {
+                    var cls = b.className;
+                    var r = b.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0
+                        && (cls.includes('confirm_btn') || cls.includes('confirmBtn'))
+                        && !cls.includes('publish_btn__');
+                });
+                if (!btn) {
+                    // publish_btn__ 제외 + 텍스트 '발행' + 크기 조건
+                    btn = btns.find(b => {
+                        var r = b.getBoundingClientRect();
+                        return b.textContent.trim() === '발행'
+                            && !b.className.includes('publish_btn__')
+                            && !b.className.includes('fold')
+                            && r.width >= 30 && r.height >= 20;
+                    });
+                }
+                if (btn) {
+                    btn.click();  // dispatchEvent 대신 실제 .click() 호출
+                    return btn.className;
+                }
+                return null;
+            }
+        """)
+        if fallback:
+            logger.info(f"[confirm] JS .click() 호출: {fallback[:80]}")
+            confirm_clicked = True
+
+    # 2-C: 키보드 Enter (패널이 열려 있을 때 Enter 키로 확인)
+    if not confirm_clicked:
+        logger.warning("[confirm] JS 탐색 실패 → 키보드 Enter 시도")
+        try:
+            await page.keyboard.press("Enter")
+            confirm_clicked = True
+            logger.info("[confirm] 키보드 Enter 전송")
+        except Exception as e:
+            logger.warning(f"[confirm] Enter 실패: {e}")
+
+    # ── PostView 리다이렉트 또는 RabbitWrite 응답 대기 (최대 25초) ──
+    # 확인 버튼 클릭 후 Naver SmartEditor는:
+    #   RabbitAutoSaveWrite.naver → RabbitWrite.naver → PostView.naver?isAfterWrite=true
+    # 순서로 진행함. URL 변화나 POST 캡처로 성공 확인.
+    try:
+        await page.wait_for_url("**/PostView.naver**", timeout=25000)
+        logger.info(f"✅ PostView 리다이렉트 완료: {page.url}")
+    except Exception:
+        # PostView로 이동하지 않은 경우 — POST 캡처 결과로 판단
+        logger.info("PostView 리다이렉트 없음 (25초 초과) → POST 캡처 내역 확인")
+        await page.wait_for_timeout(2000)
+
+    # ── 리스너 해제 + 캡처 요약 ────────────────────────────────────
+    page.remove_listener("request", _on_request)
+    if _captured_posts:
+        logger.info(f"[POST 캡처 요약] 발행 후 POST {len(_captured_posts)}건:")
+        for i, r in enumerate(_captured_posts, 1):
+            logger.info(f"  [{i}] {r['url']}")
+            logger.info(f"       payload: {r['payload'][:300]}")
+    else:
+        logger.warning("[POST 캡처] 발행 후 POST 요청 없음 → 확인 버튼 미작동")
+
+    await _screenshot(page, "05_after_final_publish", run_id)
+
+    # RabbitWrite.naver 캡처되거나 PostView URL이면 성공
+    rabbit_ok = any("RabbitWrite" in p["url"] for p in _captured_posts)
+    postview_ok = "PostView" in page.url
+    if rabbit_ok:
+        logger.info("✅ RabbitWrite.naver POST 캡처 → 발행 성공")
+        return True
+    if postview_ok:
+        logger.info("✅ PostView URL 확인 → 발행 성공")
+        return True
+    if confirm_clicked:
+        logger.warning("확인 버튼 클릭했으나 RabbitWrite 미캡처 — 외부에서 재확인 필요")
+        return True  # 외부 _verify_posted 에서 최종 판단
+    return False
+
+
+# ─────────────────────────────────────────
+# HTTP API 폴백 (브라우저 없이 requests 사용)
+# ─────────────────────────────────────────
+
+def _cookies_to_requests(playwright_cookies):
+    """Playwright 쿠키 리스트 → requests CookieJar 호환 dict"""
+    return {c["name"]: c["value"] for c in playwright_cookies if "name" in c and "value" in c}
+
+
+def post_via_http(title, content_html, tags, category, blog_config) -> bool:
+    """
+    브라우저 없이 requests로 Naver Blog AJAX API 직접 호출.
+    저장된 쿠키가 유효해야 동작 (만료 시 False 반환).
+    """
+    import requests as req
+
+    cookie_data = load_cookies(blog_config["cookie_file"])
+    if not cookie_data:
+        logger.error("[HTTP] 저장된 쿠키 없음 — first_login.py 실행 필요")
+        return False
+
+    blog_id  = blog_config["blog_id"]
+    naver_id = blog_config["naver_id"]
+
+    session = req.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Referer": f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://blog.naver.com",
+    })
+    session.cookies.update(_cookies_to_requests(cookie_data))
+
+    # 로그인 상태 확인
+    try:
+        check = session.get("https://www.naver.com", timeout=10)
+        if naver_id.lower() not in check.text.lower() and "로그아웃" not in check.text:
+            logger.error("[HTTP] 쿠키 만료 — first_login.py 로 재로그인 필요")
+            return False
+    except Exception as e:
+        logger.error(f"[HTTP] 로그인 확인 실패: {e}")
+        return False
+
+    # 글쓰기 폼 GET → 숨겨진 토큰 추출
+    try:
+        form_resp = session.get(
+            f"https://blog.naver.com/PostWriteForm.naver?blogId={blog_id}",
+            timeout=15,
+        )
+    except Exception as e:
+        logger.error(f"[HTTP] 글쓰기 폼 로드 실패: {e}")
+        return False
+
+    # CSRF / blogNo 파싱 시도
+    blog_no = ""
+    import re
+    m = re.search(r'"blogNo"\s*:\s*"?(\d+)"?', form_resp.text)
+    if m:
+        blog_no = m.group(1)
+
+    # 포스팅 AJAX 요청
+    post_data = {
+        "blogId":              blog_id,
+        "blogNo":              blog_no,
+        "logNo":               "0",
+        "title":               title,
+        "contents":            content_html,
+        "categoryNo":          "0",
+        "tag":                 tags,
+        "type":                "post",
+        "status":              "publish",
+        "useRssYN":            "Y",
+        "allowComment":        "true",
+        "allowLike":           "true",
+        "allowExternalSearch": "true",
+        "addCategoryYN":       "N",
+        "addContents":         "",
+        "publishDate":         "",
+        "publishTime":         "",
+        "cclUploadLicense":    "",
+        "cclCommercial":       "",
+        "cclModification":     "",
+    }
+
+    try:
+        resp = session.post(
+            "https://blog.naver.com/PostSaveAjax.naver",
+            data=post_data,
+            timeout=30,
+        )
+        logger.info(f"[HTTP] 응답 {resp.status_code}: {resp.text[:300]}")
+        try:
+            j = resp.json()
+            if j.get("result") == "SUCCESS" or j.get("logNo") or j.get("postNo"):
+                logger.info(f"[HTTP] ✅ 포스팅 성공: {j}")
+                return True
+            logger.error(f"[HTTP] API 오류 응답: {j}")
+        except Exception:
+            # JSON이 아닌 경우 200이면 성공으로 간주
+            if resp.status_code == 200 and "error" not in resp.text.lower():
+                logger.info("[HTTP] ✅ 포스팅 성공 (비JSON 200 응답)")
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"[HTTP] POST 실패: {e}")
+        return False
+
+
+# ─────────────────────────────────────────
+# 동기 래퍼 & 로컬 저장
+# ─────────────────────────────────────────
+
+def post_blog(title, content_html, tags, category, blog_config):
+    """브라우저 시도 → HTTP API 폴백 → False"""
+    # 브라우저 시도
+    try:
+        return asyncio.run(post_to_naver_blog(title, content_html, tags, category, blog_config))
+    except BrowserUnavailableError:
+        logger.warning("[post_blog] 브라우저 불가 → HTTP API 폴백")
+        return post_via_http(title, content_html, tags, category, blog_config)
+
+
+def save_post_locally(title, content_html, tags, category, blog_config, filename=None, sections=None):
+    """
+    [수정] 포스트를 로컬 JSON 파일로 저장. 파일명은 ASCII로만 구성.
+    """
+    from unicodedata import normalize
+    import re
+
+    if not filename:
+        # 파일명에서 한글 및 특수문자 제거 (ASCII만 남김)
+        now = datetime.now()
+        slug = (
+            normalize("NFKD", title)
+            .encode("ascii", "ignore")
+            .decode("ascii")
+        )
+        slug = re.sub(r"[^\w\s-]", "", slug).strip().lower()
+        slug = re.sub(r"[-\s]+", "-", slug)
+        
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{slug[:50]}.json"
+    
+    blog_folder = ""
+    for key, cfg in BLOGS.items():
+        if cfg["name"] == blog_config["name"]:
+            blog_folder = key
+            break
+            
+    if not blog_folder:
+        logger.warning(f"config.py에서 '{blog_config['name']}'에 해당하는 블로그 키를 찾지 못했습니다. drafts/ 루트에 저장합니다.")
+        
+    # [수정] 올바른 drafts 하위 폴더 경로 생성
+    drafts_dir = os.path.join(os.path.dirname(__file__), "drafts", blog_folder)
+    os.makedirs(drafts_dir, exist_ok=True)
+    
+    # [수정] 최종 파일 경로
+    filepath = os.path.join(drafts_dir, filename)
+
+    post_data = {
+        "title": title,
+        "content_html": content_html,
+        "tags": tags,
+        "category": category,
+        "sections": sections or [],
+        "blog": blog_config.get("name", ""),
+        "created_at": datetime.now().isoformat(),
+        "posted": False,
+    }
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(post_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"임시 저장: {filepath}")
+        return filepath
+    except Exception as e:
+        logger.error(f"'{filepath}' 저장 실패: {e}")
+        return None
+
+
+# [수정] main 함수에서 실패 시 sys.exit(1) 호출
+if __name__ == "__main__":
+    import argparse
+    from config import BLOGS
+
+    parser = argparse.ArgumentParser(description="네이버 블로그 포스팅 스크립트")
+    parser.add_argument("--draft_path", required=True, help="포스팅할 JSON 파일 경로")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    try:
+        with open(args.draft_path, "r", encoding="utf-8") as f:
+            draft = json.load(f)
+    except FileNotFoundError:
+        logger.error(f"오류: 파일을 찾을 수 없습니다 - {args.draft_path}")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        logger.error(f"오류: JSON 형식이 올바르지 않습니다 - {args.draft_path}")
+        sys.exit(1)
+
+    blog_name = draft.get("blog")
+    if not blog_name:
+        logger.error(f"오류: draft 파일 '{args.draft_path}'에 'blog' 키가 정의되지 않았습니다.")
+        sys.exit(1)
+
+    blog_config = None
+    for config in BLOGS.values():
+        if config.get("name") == blog_name:
+            blog_config = config
+            break
+
+    if not blog_config:
+        logger.error(f"오류: config.py에 '{blog_name}' 블로그 설정이 없습니다.")
+        sys.exit(1)
+    
+    # 필수 필드 확인
+    required_fields = ["title", "content_html", "tags"]
+    if not all(field in draft for field in required_fields):
+        missing = [field for field in required_fields if field not in draft]
+        logger.error(f"오류: JSON 파일에 필수 필드가 누락되었습니다 - {', '.join(missing)}")
+        sys.exit(1)
+
+    # 포스팅 실행
+    success = asyncio.run(post_to_naver_blog(
+        title=draft["title"],
+        content_html=draft["content_html"],
+        tags=draft["tags"],
+        category=draft.get("category", "일상·생각"),
+        blog_config=blog_config
+    ))
+
+    # [수정] 결과에 따라 exit code 분기
+    if success:
+        logger.info("✅ 포스팅 성공!")
+        # 성공 시 로컬 파일 삭제 또는 'posted: true'로 업데이트
+        draft['posted'] = True
+        with open(args.draft_path, "w", encoding="utf-8") as f:
+            json.dump(draft, f, ensure_ascii=False, indent=2)
+        sys.exit(0)
+    else:
+        logger.error("❌ 포스팅 실패.")
+        sys.exit(1)

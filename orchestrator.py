@@ -257,6 +257,13 @@ JSON 배열만 반환 (다른 텍스트 없음):
         tags         = post_data.get("tags", "")
         result["title"] = title
 
+        # ── TEST MARKER ────────────────────────────────────────────
+        _TEST_MARKER = "[TEST-20260417-A]"
+        logger.info(f"TEST MARKER ACTIVE: {_TEST_MARKER}")
+        title = f"{_TEST_MARKER} {title}"
+        content_html = f"<p>{_TEST_MARKER}</p>\n{content_html}"
+        # ──────────────────────────────────────────────────────────
+
         # ── 5. 배포 ────────────────────────────────────────────────
         logger.info("[5/5] DeployAgent 실행")
         deploy_result = self.deploy.publish(blog_key, title, content_html, tags, category)
@@ -378,3 +385,13 @@ def run_orchestrator_session() -> dict:
     """scheduler.py 및 daily_poster.py가 호출하는 진입점"""
     orch = BlogOrchestrator()
     return orch.run_session()
+
+
+def run_single_post_via_orchestrator() -> dict:
+    """테스트용: orchestrator 파이프라인으로 1개 포스트만 생성·발행"""
+    orch = BlogOrchestrator()
+    plan = orch.plan_session()
+    if not plan:
+        logger.error("[TEST] 포스팅 계획 없음")
+        return {"success": False, "posted": 0}
+    return orch.run_post_pipeline(plan[0])

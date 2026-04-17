@@ -14,6 +14,7 @@ from typing import Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.base_agent import BaseAgent, GEMMA_12B, GEMMA_27B, NEMOTRON_12B, NEMOTRON_9B, MISTRAL_24B, GPT_OSS_20B, STEPFUN, LLAMA_70B
+from config import IMAGE_EXCLUDE_KEYWORDS
 from image_finder import search_unsplash, search_pexels, search_pixabay
 
 logger = logging.getLogger(__name__)
@@ -23,42 +24,95 @@ class ImageAgent(BaseAgent):
     """이미지 수집 및 AI 생성 에이전트"""
 
     def __init__(self):
-        # 이미지 프롬프트 생성 → 경량 모델로도 충분
+        # ... (생성자 내용은 기존과 동일)
         super().__init__(
             model=GEMMA_12B,
             fallback_models=[GEMMA_27B, NEMOTRON_12B, NEMOTRON_9B, MISTRAL_24B, GPT_OSS_20B, STEPFUN, LLAMA_70B],
         )
 
-    def get_image(self, topic: str, category: str) -> Tuple[str, str, str]:
+    def get_images(self, image_keywords_list: list, category: str, max_images: int = 3) -> list:
         """
-        주제에 맞는 이미지 URL, alt 텍스트, 크레딧 반환.
-        Unsplash → Pexels → Pixabay → Pollinations.ai 순서로 시도.
+        [수정됨] 여러 개의 키워드로 여러 장의 이미지 검색.
+        - 대표 이미지 키워드 + 소주제별 키워드를 받아 리스트로 반환.
+        - URL 중복을 방지하며 max_images 개수만큼 채워지면 중단.
         """
-        # AI로 최적 영어 검색 키워드 생성
-        query = self._get_search_query(topic, category)
-        logger.info(f"[ImageAgent] 이미지 검색 쿼리: '{query}'")
+        found_images = []
+        found_urls = set()
 
-        # 1순위: Unsplash
-        imgs = search_unsplash(query)
-        if imgs:
-            img = random.choice(imgs[:5])
-            return img["url"], img.get("alt", query), f"📸 Photo by {img['photographer']} on Unsplash"
+        # 필터링 키워드 준비
+        negative_keywords = " ".join([f"-{kw}" for kw in IMAGE_EXCLUDE_KEYWORDS])
 
-        # 2순위: Pexels
-        imgs = search_pexels(query)
-        if imgs:
-            img = random.choice(imgs[:5])
-            return img["url"], img.get("alt", query), f"📸 Photo by {img['photographer']} on Pexels"
+        for query in image_keywords_list:
+            if len(found_images) >= max_images:
+                break
+            if not query:
+                continue
 
-        # 3순위: Pixabay
-        imgs = search_pixabay(query)
-        if imgs:
-            img = random.choice(imgs[:5])
-            return img["url"], img.get("alt", query), "📸 Image from Pixabay"
+            query_with_exclusion = f"{query} {negative_keywords}".strip()
+            logger.info(f"[ImageAgent] 이미지 검색: '{query_with_exclusion}'")
 
-        # 4순위: Pollinations.ai (AI 이미지 생성, 완전 무료·키 없음)
-        logger.info("[ImageAgent] 무료 이미지 없음 → Pollinations.ai로 AI 이미지 생성")
-        return self._generate_with_pollinations(topic, category)
+            # 이미지 소스 순회 (Unsplash -> Pexels -> Pixabay)
+            for search_func in [search_unsplash, search_pexels, search_pixabay]:
+                if len(found_images) >= max_images:
+                    break
+                
+                try:
+                    # Unsplash는 제외 쿼리 직접 사용, 나머지는 결과 필터링
+                    search_query = query_with_exclusion if search_func == search_unsplash else query
+                    imgs = search_func(search_query)
+                    imgs = self._filter_results(imgs)
+
+                    for img in imgs:
+                        if img["url"] not in found_urls:
+                            source = "Unsplash"
+                            if search_func == search_pexels: source = "Pexels"
+                            if search_func == search_pixabay: source = "Pixabay"
+                            
+                            photographer_credit = ""
+                            if source in ["Unsplash", "Pexels"]:
+                                photographer_credit = f"📸 Photo by {img['photographer']} on {source}"
+                            else:
+                                photographer_credit = f"📸 Image from {source}"
+
+                            found_images.append({
+                                "url": img["url"],
+                                "alt": img.get("alt", query),
+                                "credit": photographer_credit
+                            })
+                            found_urls.add(img["url"])
+                            
+                            if len(found_images) >= max_images:
+                                break
+                except Exception as e:
+                    logger.warning(f"[ImageAgent] {search_func.__name__} 검색 중 오류: {e}")
+
+        # 이미지를 하나도 못 찾았으면 AI로 대표 이미지 생성
+        if not found_images:
+            logger.info("[ImageAgent] 무료 이미지 없음 → Pollinations.ai로 AI 이미지 생성")
+            # 대표 키워드가 리스트의 첫 번째 항목이라고 가정
+            main_topic_or_keyword = image_keywords_list[0] if image_keywords_list else category
+            url, alt, credit = self._generate_with_pollinations(main_topic_or_keyword, category)
+            if url:
+                found_images.append({"url": url, "alt": alt, "credit": credit})
+        
+        logger.info(f"[ImageAgent] 최종 {len(found_images)}개 이미지 수집 완료.")
+        return found_images
+
+    def _filter_results(self, images: list) -> list:
+        """결과 리스트에서 제외 키워드가 포함된 이미지 필터링"""
+        if not images:
+            return []
+        
+        filtered = []
+        for img in images:
+            alt_text = img.get("alt", "").lower()
+            # any()는 하나라도 True이면 True를 반환
+            if not any(kw in alt_text for kw in IMAGE_EXCLUDE_KEYWORDS):
+                filtered.append(img)
+        
+        if len(images) > len(filtered):
+            logger.debug(f"[ImageAgent] 필터링: {len(images)}개 → {len(filtered)}개 (제외 키워드 적용)")
+        return filtered
 
     def _get_search_query(self, topic: str, category: str) -> str:
         """AI로 이미지 검색에 최적화된 영어 키워드 생성"""
